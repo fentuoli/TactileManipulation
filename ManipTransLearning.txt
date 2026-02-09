@@ -1,0 +1,1264 @@
+
+ ▐▛███▜▌   Claude Code v2.1.25
+▝▜█████▛▘  Opus 4.5 · Claude Max
+  ▘▘ ▝▝    ~/Code/ManipTrans/ManipTrans-old
+
+  Debug mode enabled
+  Logging to: /home/bore/.claude/debug/8967a46b-bc58-43d1-a67b-0e563fd26a4b.txt
+
+❯ 请参考README.md文件，分析这个代码库的用途，功能，文件结构，预训练，训练和 
+  测试的流程，关键代码，预期效果                                            
+  ⎿  Interrupted · What should Claude do instead?
+
+❯ 假设我是一个学生，需要一步一步指导我 
+
+● Read 1 file (ctrl+o to expand)
+
+● Explore(Explore codebase structure) Haiku 4.5
+  ⎿
+     Waiting…d /home/bore/Code/ManipTrans -maxdepth 2 -type d | sort)
+
+     +6 more tool uses (ctrl+o to expand)
+  ⎿  Interrupted · What should Claude do instead?
+
+❯ 请分析ManipTrans-old仓库 
+
+● Searched for 2 patterns, read 1 file (ctrl+o to expand)
+
+● Now let me read a few key files to understand the core logic.
+
+● Read 3 files (ctrl+o to expand)
+
+● 好的，下面我以学生能理解的方式，逐步为你分析 ManipTrans-old 代码库。
+
+  ---
+  一、项目是做什么的？
+
+  ManipTrans (CVPR 2025)
+  解决的问题是：如何将人手抓取/操作物体的动作，迁移到各种机器人灵巧手上。
+
+  核心思路：
+  1. 有一段人手操作物体的动作数据（来自 MANO 人手模型）
+  2. 先用 Imitator（模仿器）网络生成基础动作
+  3. 再用 Residual 
+  Learning（残差学习）在物理仿真中微调，使机器人手真正能抓住并操作物体
+
+  支持多种灵巧手：Inspire、Shadow、Allegro、XHand、Arti-Mano、Inspire FTP。
+
+  ---
+  二、文件结构总览
+
+  ManipTrans-old/
+  ├── main/                          # 主逻辑
+  │   ├── cfg/                       # Hydra 配置文件 (YAML)
+  │   ├── dataset/                   # 数据集加载与预处理
+  │   │   ├── base.py                # ManipData 基类：定义数据接口
+  │   │   ├── factory.py             # 根据 data_idx 选择数据集
+  │   │   ├── grab_dataset_dexhand.py     # GRAB 数据集加载
+  │   │   ├── oakink2_dataset_dexhand_rh.py  # OakInk2 右手数据集
+  │   │   ├── oakink2_dataset_dexhand_lh.py  # OakInk2 左手数据集
+  │   │   ├── mano2dexhand.py        # 预处理：MANO→灵巧手重定向
+  │   │   └── transform.py           # 旋转表示转换工具
+  │   └── rl/
+  │       └── train.py               # 训练/测试入口脚本
+  │
+  ├── lib/                           # 强化学习核心库
+  │   ├── rl/
+  │   │   ├── agent.py               # PPO Agent
+  │   │   ├── base.py                # 算法基类
+  │   │   ├── player.py              # 推理/测试 player
+  │   │   ├── runner.py              # 训练循环 runner
+  │   │   ├── models.py              # A2C 模型（Actor-Critic）
+  │   │   ├── res_models.py          # 残差学习模型
+  │   │   ├── network_builder.py     # 基础网络
+  │   │   ├── network_builder_residual_sh.py  # 单手残差网络
+  │   │   ├── network_builder_residual_bih.py # 双手残差网络
+  │   │   └── moving_avg.py          # 动作平滑
+  │   ├── nn/                        # MLP、特征网络等
+  │   └── utils/                     # rlgames 工具、config、wandb 等
+  │
+  ├── maniptrans_envs/               # IsaacGym 仿真环境
+  │   └── lib/
+  │       ├── envs/
+  │       │   ├── core/
+  │       │   │   ├── vec_task.py     # 向量化任务基类（并行环境）
+  │       │   │   └── sim_config.py   # 仿真参数配置
+  │       │   ├── tasks/
+  │       │   │   ├── dexhandmanip_sh.py   # 单手操作任务环境
+  │       │   │   ├── dexhandmanip_bih.py  # 双手操作任务环境
+  │       │   │   └── dexhandimitator.py   # 模仿器任务环境
+  │       │   └── dexhands/           # 各种灵巧手的配置
+  │       │       ├── base.py         # DexHand 基类
+  │       │       ├── inspire.py      # Inspire 手配置
+  │       │       ├── shadow.py       # Shadow 手配置
+  │       │       ├── allegro.py      # Allegro 手配置
+  │       │       └── ...
+  │       └── utils/                  # 物理仿真工具函数
+  │
+  ├── DexManipNet/                   # 数据集可视化与处理工具
+  ├── assets/                        # URDF、预训练模型路径
+  ├── setup.py
+  └── requirements.txt
+
+  ---
+  三、完整流程（三步走）
+
+  第 1 步：预处理（Retargeting）
+
+  脚本: main/dataset/mano2dexhand.py
+
+  做什么: 把人手 MANO 关键点重定向到灵巧手的关节角度，生成初始
+  DOF（自由度）参考值。
+
+  python main/dataset/mano2dexhand.py --data_idx g0 --dexhand inspire --headless
+   --iter 2000
+
+  这一步输出的 .pkl 文件包含
+  opt_wrist_pos、opt_wrist_rot、opt_dof_pos，后续训练会通过 base.py 的
+  load_retargeted_data() 加载。
+
+  第 2 步：训练（RL Training）
+
+  脚本: main/rl/train.py（Hydra 配置驱动）
+
+  整体流程:
+  1. train.py 使用 Hydra 加载 YAML 配置
+  2. 创建 IsaacGym 并行仿真环境（4096 个环境同时跑）
+  3. 加载预训练 Imitator checkpoint 作为 base policy
+  4. 用 PPO 算法 训练残差策略（Residual Policy），在 base policy
+  输出上叠加修正量
+
+  关键参数含义:
+  - task=ResDexHand → 使用残差学习任务
+  - side=RH/LH/BiH → 右手/左手/双手
+  - rh_base_model_checkpoint → 预训练模仿器权重
+  - randomStateInit=true → 参考状态初始化（RSI）
+  - actionsMovingAverage=0.4 → 动作平滑系数
+  - early_stop_epochs=100 → 早停轮数
+
+  关键代码路径:
+  - 环境 step/reward → maniptrans_envs/lib/envs/tasks/dexhandmanip_sh.py
+  - 残差网络 → lib/rl/network_builder_residual_sh.py（加载 base model，输出 =
+  base + residual）
+  - PPO 训练循环 → lib/rl/agent.py + lib/rl/base.py
+
+  第 3 步：测试
+
+  同一个 train.py，设 test=true，加载训练好的 checkpoint：
+
+  python main/rl/train.py ... test=true checkpoint=runs/xxx/nn/xxx.pth
+  headless=false num_envs=4
+
+  headless=false 会打开 IsaacGym GUI 可视化，能看到灵巧手操作物体。
+
+  ---
+  四、核心设计思想
+
+  人手动作数据 (MANO)
+         │
+         ▼ (mano2dexhand.py 重定向)
+  灵巧手初始参考轨迹
+         │
+         ▼ (预训练 Imitator 作为 base policy)
+  Base Action = Imitator(observation)
+         │
+         ▼ (PPO 训练残差策略)
+  Final Action = Base Action + Residual(observation)
+         │
+         ▼ (IsaacGym 物理仿真)
+  灵巧手在仿真中操作物体
+
+  残差学习的好处：不需要从零学习，只需学习 base policy
+  的"修正量"，收敛更快更稳定。
+
+  ---
+  五、预期效果
+
+  训练成功后，灵巧手能在 IsaacGym 仿真中：
+  - 单手: 抓取、操作物体（如拿杯子、盖笔帽）
+  - 双手: 双手协作操作（如双手传递物体）
+  - 跨手型迁移: 同一段人手动作可以迁移到 6 种不同灵巧手上
+
+  ---
+  六、作为学生，建议的学习顺序
+
+  1. 先读 README.md，理解整体目标
+  2. 看 maniptrans_envs/lib/envs/dexhands/inspire.py，理解灵巧手配置（关节映射、
+  接触体等）
+  3. 看 main/dataset/base.py，理解数据格式（轨迹、速度、接触距离）
+  4. 看 maniptrans_envs/lib/envs/tasks/dexhandmanip_sh.py，理解仿真环境的
+  observation、reward、reset
+  5. 看 lib/rl/network_builder_residual_sh.py，理解残差网络如何叠加到 base
+  policy
+  6. 看 main/rl/train.py，理解训练入口如何串联以上所有组件
+
+  如果需要我深入讲解某个具体文件或模块，告诉我即可。
+
+✻ Crunched for 1m 3s
+
+❯ 请深入讲解初始的重定向和imitator的训练，人手的mano格式是怎么样的，如何进  
+  行初始重定向，如何进行imitator的训练，数据格式等都细细讲清楚              
+
+● Read 3 files (ctrl+o to expand)
+
+● Now let me read a few more supporting files.
+
+● Read 3 files (ctrl+o to expand)
+
+● 好，现在我已经阅读了所有关键文件。下面给你一份详细的、面向学生的深入讲解。
+
+  ---
+  深入讲解：MANO 重定向 + Imitator 训练
+
+  一、人手 MANO 模型是什么？
+
+  MANO (Model for hANd arOtation) 是一个参数化人手模型，类似于 SMPL
+  对人体的建模。
+
+  MANO 输出的数据格式
+
+  从代码 grab_dataset_dexhand.py:109-137 可以看到，MANO 模型输出：
+
+  mano_out_verts:   [T, 778, 3]   ← 778 个顶点，每个顶点 3D 坐标
+  mano_out_joints:  [T, 16, 3]    ← 16 个关节点，通过 J_regressor 从顶点回归
+
+  其中 16 个关节分布为（索引 0-15）：
+  0: wrist（手腕）
+  1-3:  index  (proximal → intermediate → distal)  食指
+  4-6:  middle (proximal → intermediate → distal)  中指
+  7-9:  pinky  (proximal → intermediate → distal)  小指
+  10-12: ring  (proximal → intermediate → distal)  无名指
+  13-15: thumb (proximal → intermediate → distal)  大拇指
+
+  代码中如何组织 MANO 数据
+
+  在 grab_dataset_dexhand.py:116-137，数据被组织成一个字典：
+
+  mano_joints = {
+      "index_proximal":      joints[:, 1],       # [T, 3]
+      "index_intermediate":  joints[:, 2],
+      "index_distal":        joints[:, 3],
+      "index_tip":           verts[:, 353],       # 指尖用特定顶点代替，更精确
+      "middle_proximal":     joints[:, 4],
+      ...
+      "thumb_tip":           verts[:, 766],
+  }
+
+  注意：指尖 (tip) 不用关节回归的结果，而是直接取 mesh 上特定顶点（353, 467,
+  695, 576, 766），因为这些位置比回归的关节更接近真实指尖。
+
+  完整的数据集输出格式
+
+  __getitem__ 返回的 data 字典（grab_dataset_dexhand.py:150-163）：
+  键名: obj_trajectory
+  形状: [T, 4, 4]
+  含义: 物体每帧的齐次变换矩阵
+  ────────────────────────────────────────
+  键名: obj_verts
+  形状: [1000, 3]
+  含义: 物体表面采样的 1000 个点
+  ────────────────────────────────────────
+  键名: obj_urdf_path
+  形状: str
+  含义: 物体 URDF 路径
+  ────────────────────────────────────────
+  键名: wrist_pos
+  形状: [T, 3]
+  含义: 手腕 3D 位置
+  ────────────────────────────────────────
+  键名: wrist_rot
+  形状: [T, 3, 3]
+  含义: 手腕旋转矩阵（已乘以 relative_rotation）
+  ────────────────────────────────────────
+  键名: mano_joints
+  形状: dict{str: [T, 3]}
+  含义: 19 个关键点的 3D 轨迹
+  经过 base.py 的 process_data() 后，会额外计算：
+  键名: obj_velocity
+  形状: [T, 3]
+  含义: 物体线速度（高斯平滑后的数值微分）
+  ────────────────────────────────────────
+  键名: obj_angular_velocity
+  形状: [T, 3]
+  含义: 物体角速度
+  ────────────────────────────────────────
+  键名: wrist_velocity
+  形状: [T, 3]
+  含义: 手腕线速度
+  ────────────────────────────────────────
+  键名: wrist_angular_velocity
+  形状: [T, 3]
+  含义: 手腕角速度
+  ────────────────────────────────────────
+  键名: tips_distance
+  形状: [T, 5]
+  含义: 五个指尖到物体的 Chamfer 距离
+  ────────────────────────────────────────
+  键名: mano_joints_velocity
+  形状: dict{str: [T, 3]}
+  含义: 各关键点速度
+  经过 load_retargeted_data() 后（如果有重定向结果），增加：
+  ┌───────────────┬─────────────┬─────────────────────────────────────────────┐
+  │     键名      │    形状     │                    含义                     │
+  ├───────────────┼─────────────┼─────────────────────────────────────────────┤
+  │ opt_wrist_pos │ [T, 3]      │ 优化后的灵巧手手腕位置                      │
+  ├───────────────┼─────────────┼─────────────────────────────────────────────┤
+  │ opt_wrist_rot │ [T, 3]      │ 优化后的手腕旋转（axis-angle）              │
+  ├───────────────┼─────────────┼─────────────────────────────────────────────┤
+  │ opt_dof_pos   │ [T, n_dofs] │ 优化后的关节角度（如 Inspire 有 12 个 DOF） │
+  └───────────────┴─────────────┴─────────────────────────────────────────────┘
+  ---
+  二、重定向（Retargeting）详解
+
+  文件: main/dataset/mano2dexhand.py
+
+  问题：为什么需要重定向？
+
+  人手 MANO 有 16 个关节 + 778 个顶点，而灵巧手（如 Inspire）只有 12
+  个自由度（DOF）。它们的运动学结构完全不同。重定向就是要找到灵巧手的关节角度，
+  使得灵巧手的关键部位尽量靠近人手的对应关键点。
+
+  映射关系
+
+  在 inspire.py:48-70 定义了 hand2dex_mapping：
+
+  hand2dex_mapping = {
+      "wrist":              ["hand_base_link"],
+      "thumb_proximal":     ["thumb_proximal", "thumb_proximal_base"],  # 一对多
+      "index_proximal":     ["index_proximal"],
+      "index_distal":       [],              # Inspire 手没有这个关节！
+      "index_tip":          ["index_tip"],
+      ...
+  }
+
+  这里体现了一个关键点：人手和灵巧手不是一一对应的。有些人手关节在灵巧手上不存在
+  （如 index_distal 为空列表），有些可能一对多。
+
+  relative_rotation 的含义
+
+  inspire.py:132-137：
+  self.relative_rotation = (
+      aa_to_rotmat([-π/36, 0, 0])      # 微调 X 轴
+      @ aa_to_rotmat([0, 0, π/36])      # 微调 Z 轴
+      @ aa_to_rotmat([0, 0, -π/2])      # 主旋转
+      @ aa_to_rotmat([0, π, 0])         # 翻转
+  )
+
+  这是因为 MANO 手腕坐标系和灵巧手 URDF
+  的手腕坐标系朝向不同，需要一个固定的旋转来对齐。在
+  grab_dataset_dexhand.py:139-141 中使用：
+
+  wrist_rot = aa_to_rotmat(hand_rot) @ relative_rotation
+
+  重定向优化过程
+
+  Mano2Dexhand.fitting() 方法（mano2dexhand.py:311-441）是核心：
+
+  输入:
+  - target_mano_joints: [N_envs, n_body_names, 3] — 人手关键点目标位置
+  - target_wrist_pos/rot: 手腕目标位姿
+  - obj_trajectory: 物体轨迹（仅用于可视化时定位物体）
+
+  优化变量（三个可学习参数）:
+  opt_wrist_pos   = [N_envs, 3]      # 灵巧手手腕位置,  lr=0.0008
+  opt_wrist_rot   = [N_envs, 6]      # 6D 旋转表示,      lr=0.0008
+  opt_dof_pos     = [N_envs, n_dofs]  # 关节角度,         lr=0.0004
+
+  注意：旋转用 6D 表示（rot6d），而不是四元数或 axis-angle，因为 6D
+  旋转表示对优化更友好（连续、无奇异点）。
+
+  优化目标（mano2dexhand.py:406-423）:
+
+  # 1. 用 pytorch_kinematics 做正运动学
+  ret = chain.forward_kinematics(opt_dof_pos_clamped)
+  pk_joints = [ret[body_name].position for each body]
+
+  # 2. 将关节变换到世界坐标系
+  pk_joints = wrist_rotation @ pk_joints + wrist_position
+
+  # 3. 计算加权 L2 损失
+  loss = mean(||pk_joints - target_joints|| * weight)
+
+  权重设计（mano2dexhand.py:347-368）：
+  thumb_tip:   25    ← 拇指指尖最重要
+  index_tip:   20
+  middle_tip:  10
+  ring_tip:    7
+  pinky_tip:   5
+  proximal:    1     ← 近端关节权重最低
+  intermediate: 1
+
+  指尖权重远大于近端关节，因为指尖位置直接决定能否抓住物体。
+
+  初始化技巧（mano2dexhand.py:322-326）:
+  offset = (middle_pos + wrist_pos) / 2 - obj_pos
+  offset = normalize(offset) * 0.2
+  opt_wrist_pos = target_wrist_pos + offset  # 初始时手离物体远一点
+
+  初始位置故意偏离物体 0.2m，避免初始穿模。
+
+  收敛判断: 每 100 次迭代检查 loss 变化，小于 1e-5 则提前停止。
+
+  输出 保存为 .pkl 文件:
+  {
+      "opt_wrist_pos":  [T, 3],        # 每帧优化后的手腕位置
+      "opt_wrist_rot":  [T, 3],        # axis-angle 格式
+      "opt_dof_pos":    [T, n_dofs],   # 每帧的关节角度
+      "opt_joints_pos": [T, n_bodies, 3]  # 每帧各刚体位置（仅用于分析）
+  }
+
+  关键理解: 这个过程是每帧独立优化的（N_envs = T，每个 env 对应一帧），通过
+  IsaacGym 并行跑所有帧。不是逐帧序列优化，而是所有帧同时优化。
+
+  ---
+  三、Imitator 训练详解
+
+  文件: maniptrans_envs/lib/envs/tasks/dexhandimitator.py
+
+  Imitator
+  是第一阶段的策略网络，学习单纯地模仿人手动作（还没有物体交互的物理约束）。
+
+  3.1 环境设置
+
+  DexHandImitatorRHEnv 继承自 VecTask，在 IsaacGym 中创建：
+  - 一个灵巧手（浮空，无重力 disable_gravity=True）
+  - 一张桌子（纯视觉参考，碰撞被忽略）
+  - 没有物体！Imitator 阶段只学手的运动，不涉及物体操控
+
+  关节驱动模式 = DOF_MODE_POS（位置控制），stiffness=500, damping=30。
+
+  3.2 观察空间（Observation）
+
+  从 compute_observations() (dexhandimitator.py:636-753) 可以看出三部分观察：
+
+  1) proprioception（本体感知）:
+  - q: 关节角度 [n_dofs]
+  - cos_q, sin_q: 关节角的 sin/cos 编码
+  - base_state: 手腕位姿 [pos(3), quat(4), vel(3), ang_vel(3)]（pos 被置零）
+
+  2) target（目标观察）— 最重要的部分:
+
+  以未来 obs_future_length 帧为目标，计算：
+  delta_wrist_pos:      目标手腕位置 - 当前手腕位置        [K*3]
+  wrist_vel:            目标手腕速度                       [K*3]
+  delta_wrist_vel:      目标速度 - 当前速度                [K*3]
+  wrist_quat:           目标手腕四元数                     [K*4]
+  delta_wrist_quat:     当前四元数与目标的差               [K*4]
+  wrist_ang_vel:        目标角速度                         [K*3]
+  delta_wrist_ang_vel:  角速度差                           [K*3]
+  delta_joints_pos:     各关键点目标位置 - 当前位置         [K*(n_bodies-1)*3]
+  joints_vel:           各关键点目标速度                   [K*(n_bodies-1)*3]
+  delta_joints_vel:     速度差                             [K*(n_bodies-1)*3]
+
+  这里 delta_xxx 是关键设计：策略看到的是差值，而非绝对坐标，更容易泛化。
+
+  3) privileged（特权观察，可选）:
+  - 物体位置、质量、指尖接触力等（仅在某些配置下使用）
+
+  3.3 动作空间（Action）
+
+  从 pre_physics_step() (dexhandimitator.py:877-979)：
+
+  非 PID 模式（6D-Force，主要方法）：
+  actions[:, 0:3]  → 手腕线性力   (乘以 translation_scale * 500 * dt)
+  actions[:, 3:6]  → 手腕扭矩     (乘以 orientation_scale * 200 * dt)
+  actions[:, 6:6+n_dofs] → 关节目标位置 (经过 scale 映射到关节限位范围)
+
+  手腕通过 apply_rigid_body_force_tensors
+  施加力/扭矩驱动（浮空的自由体），手指通过位置控制
+  set_dof_position_target_tensor 驱动。
+
+  PID 模式（备选）：
+  actions[:, 0:3]  → 位置误差信号 → PID 控制器 → 力
+  actions[:, 3:9]  → 6D 旋转误差 → PID 控制器 → 扭矩
+  actions[:, 9:9+n_dofs] → 关节目标位置
+
+  动作平滑：curr = α * new + (1-α) * prev，α = actionsMovingAverage（如 0.4）。
+
+  3.4 奖励函数
+
+  compute_imitation_reward() (dexhandimitator.py:1066-1201)，是
+  @torch.jit.script 编译的高性能函数：
+
+  奖励项（全部是指数衰减形式 exp(-k * distance)）:
+  ┌───────────────────────┬──────┬────────────┬─────────────────┐
+  │        奖励项         │ 系数 │ 衰减因子 k │      含义       │
+  ├───────────────────────┼──────┼────────────┼─────────────────┤
+  │ reward_eef_pos        │ 0.1  │ 40         │ 手腕位置        │
+  ├───────────────────────┼──────┼────────────┼─────────────────┤
+  │ reward_eef_rot        │ 0.6  │ 1          │ 手腕旋转        │
+  ├───────────────────────┼──────┼────────────┼─────────────────┤
+  │ reward_thumb_tip_pos  │ 0.9  │ 100        │ 拇指指尖位置    │
+  ├───────────────────────┼──────┼────────────┼─────────────────┤
+  │ reward_index_tip_pos  │ 0.8  │ 90         │ 食指指尖        │
+  ├───────────────────────┼──────┼────────────┼─────────────────┤
+  │ reward_middle_tip_pos │ 0.75 │ 80         │ 中指指尖        │
+  ├───────────────────────┼──────┼────────────┼─────────────────┤
+  │ reward_ring_tip_pos   │ 0.6  │ 60         │ 无名指/小指指尖 │
+  ├───────────────────────┼──────┼────────────┼─────────────────┤
+  │ reward_pinky_tip_pos  │ 0.6  │ 60         │ 同上            │
+  ├───────────────────────┼──────┼────────────┼─────────────────┤
+  │ reward_level_1_pos    │ 0.5  │ 50         │ 关键近端关节    │
+  ├───────────────────────┼──────┼────────────┼─────────────────┤
+  │ reward_level_2_pos    │ 0.3  │ 40         │ 其他关节        │
+  ├───────────────────────┼──────┼────────────┼─────────────────┤
+  │ reward_power          │ 0.5  │ 10         │ 关节功率惩罚    │
+  ├───────────────────────┼──────┼────────────┼─────────────────┤
+  │ reward_wrist_power    │ 0.5  │ 2          │ 手腕功率惩罚    │
+  ├───────────────────────┼──────┼────────────┼─────────────────┤
+  │ reward_eef_vel        │ 0.1  │ 1          │ 手腕速度匹配    │
+  ├───────────────────────┼──────┼────────────┼─────────────────┤
+  │ reward_joints_vel     │ 0.1  │ 1          │ 关节速度匹配    │
+  └───────────────────────┴──────┴────────────┴─────────────────┘
+  设计理念：指尖 > 近端关节 > 速度匹配 > 功率惩罚。指尖精度至关重要。
+
+  失败条件（导致 episode 终止）:
+  failed = (
+      thumb_tip_error > 0.057 * scale_factor
+      or index_tip_error > 0.064 * scale_factor
+      or middle_tip_error > 0.071 * scale_factor
+      or ...
+  ) and running_steps >= 20
+
+  scale_factor
+  可以随训练逐渐收紧（tighten_method），一开始容忍度大，后期要求严格。
+
+  成功条件: progress_buf + 4 >= seq_len（走完整段轨迹）。
+
+  3.5 状态初始化
+
+  _reset_default() (dexhandimitator.py:755-847)：
+
+  如果 randomStateInit=True（RSI，参考状态初始化）：
+  seq_idx = random(0, 0.99 * seq_len)  # 随机选一个时间点
+  wrist_pos = demo_data["wrist_pos"][seq_idx] + noise(σ=0.01)
+  wrist_rot = demo_data["wrist_rot"][seq_idx] @ random_rotation(σ=π/18)
+  dof_pos = default_dof + noise
+
+  从轨迹的随机帧开始，而不是总从第 0
+  帧开始。这大大提高了训练效率——策略需要学会从任意状态恢复跟踪。
+
+  3.6 BPS 物体编码
+
+  dexhandimitator.py:161-167:
+  self.bps_layer = bps_torch(bps_type="grid_sphere", n_bps_points=128,
+  radius=0.2)
+  obj_bps = bps_layer.encode(obj_verts, feature_type="dists")
+
+  物体用 Basis Point Set (BPS) 编码为 128 维向量，这是一种紧凑的 3D
+  形状表示，不依赖于物体顶点数量。
+
+  ---
+  四、Residual Policy 如何叠加到 Imitator 上
+
+  文件: lib/rl/network_builder_residual_sh.py
+
+  训练好 Imitator 后，它被冻结（recurse_freeze + eval），作为 base model
+  嵌入到残差网络中：
+
+  # 第 109-123 行
+  self.base_model = load_and_build(params["base_model"])
+  base_model.load_state_dict(checkpoint)      # 加载预训练权重
+  recurse_freeze(self.base_model)             # 冻结所有参数
+  freeze_batchnorm_stats(self.base_model)
+  self.base_model.eval()                      # 永远 eval 模式
+
+  前向传播（forward(), 第 134-179 行）:
+  # 1. Base model 生成基础动作
+  base_mu, base_logstd, _, _ = self.base_model(base_obs_dict)
+  base_action = Normal(base_mu, exp(base_logstd)).sample()
+
+  # 2. 残差网络的输入 = 当前观察特征 + base_action
+  out = concat([encoded_obs, base_action])
+
+  # 3. 残差 MLP 输出修正量
+  residual_mu = self.mu(self.actor_mlp(out))
+
+  最终动作 = base_action + residual_action（在 res_models.py 中完成叠加）。
+
+  ---
+  五、总结流程图
+
+  ┌─────────────────────────────────────────────────────┐
+  │ 数据来源：GRAB / OakInk-V2 数据集                    │
+  │   → MANO 模型输出 778 顶点 + 16 关节 + 物体轨迹       │
+  └───────────────────────┬─────────────────────────────┘
+                          │
+                          ▼
+  ┌─────────────────────────────────────────────────────┐
+  │ 第 0 步：数据预处理 (base.py → process_data)          │
+  │   → 坐标系变换 (mujoco2gym_transf)                   │
+  │   → 计算速度/角速度 (数值微分 + 高斯平滑)              │
+  │   → 计算指尖-物体距离 (Chamfer Distance)              │
+  └───────────────────────┬─────────────────────────────┘
+                          │
+                          ▼
+  ┌─────────────────────────────────────────────────────┐
+  │ 第 1 步：重定向 (mano2dexhand.py)                     │
+  │   输入: MANO 关键点轨迹 [T, 19, 3]                   │
+  │   优化: wrist_pos[T,3] + wrist_rot[T,6] + dof[T,12] │
+  │   方法: Adam 优化器，正运动学 + 加权关键点 L2 损失     │
+  │   输出: .pkl 文件 (opt_wrist_pos/rot/dof_pos)         │
+  └───────────────────────┬─────────────────────────────┘
+                          │
+                          ▼
+  ┌─────────────────────────────────────────────────────┐
+  │ 第 2 步：Imitator 训练 (dexhandimitator.py)           │
+  │   环境: IsaacGym，灵巧手浮空，无物体                   │
+  │   观察: 本体感知 + 目标差值 (delta_pos/rot/vel)       │
+  │   动作: 手腕力/扭矩 + 关节目标位置                    │
+  │   奖励: 指尖跟踪 > 旋转跟踪 > 速度匹配 > 功率惩罚    │
+  │   算法: PPO (rl_games 库)                             │
+  │   输出: imitator_rh_inspire.pth                       │
+  └───────────────────────┬─────────────────────────────┘
+                          │
+                          ▼
+  ┌─────────────────────────────────────────────────────┐
+  │ 第 3 步：Residual Policy 训练 (dexhandmanip_sh.py)    │
+  │   环境: IsaacGym，灵巧手 + 物体 + 桌子 (有碰撞)      │
+  │   网络: 冻结 Imitator + 可训练残差 MLP                │
+  │   动作: base_action + residual_action                 │
+  │   目标: 在物理仿真中真正抓住并操作物体                 │
+  └─────────────────────────────────────────────────────┘
+
+  有任何具体部分需要进一步展开的，随时告诉我。
+
+✻ Crunched for 2m 21s
+
+❯ 请详细介绍residual                                                        
+  rl训练部分，包括网络以及环境设置(obs,reward,action,step)                  
+
+● Read 3 files (ctrl+o to expand)
+
+● 好，所有关键代码已读完。下面给你完整的 Residual RL 训练深入讲解。
+
+  ---
+  Residual RL 训练详解
+
+  一、与 Imitator 阶段的核心区别
+  Column 1: 环境中有物体
+  Imitator: 无
+  Residual (Manip): 有（从 URDF 加载，有碰撞/摩擦/质量）
+  ────────────────────────────────────────
+  Column 1: 重力对物体
+  Imitator: —
+  Residual (Manip): 开启（-9.8）
+  ────────────────────────────────────────
+  Column 1: reset 初始化
+  Imitator: 随机噪声 + 人手参考
+  Residual (Manip): 重定向后的 opt_dof_pos + 物体轨迹
+  ────────────────────────────────────────
+  Column 1: 观察空间
+  Imitator: 手的本体感知 + MANO 目标
+  Residual (Manip): 多出物体状态、BPS 编码、指尖距离、物体-关节距离
+  ────────────────────────────────────────
+  Column 1: 奖励
+  Imitator: 仅跟踪手的关键点
+  Residual (Manip): 多出物体位置/旋转/速度跟踪 + 指尖接触力
+  ────────────────────────────────────────
+  Column 1: 网络
+  Imitator: 单个策略网络
+  Residual (Manip): 冻结的 Imitator + 可训练残差网络
+  ────────────────────────────────────────
+  Column 1: 动作
+  Imitator: 网络直接输出
+  Residual (Manip): base_action + residual_action
+  ---
+  二、环境设置（dexhandmanip_sh.py）
+
+  2.1 场景构成
+
+  每个并行环境（4096 个）包含：
+
+  ┌──────────────────────────────────────────┐
+  │  灵巧手 (dexhand)                         │
+  │    - 浮空，无重力，力/扭矩驱动手腕        │
+  │    - 关节位置控制 (stiffness=500, damp=30) │
+  │    - 摩擦力 = 4.0（高摩擦补偿皮肤形变）   │
+  │                                           │
+  │  操作物体 (manip_obj)                     │
+  │    - 从 URDF 加载（COACD 凸分解碰撞体）   │
+  │    - 有重力、有质量（≤500g）、有摩擦(2.0)  │
+  │    - 密度 200（模拟 3D 打印低填充率）      │
+  │                                           │
+  │  桌子 (table)                             │
+  │    - 固定，摩擦 0.1                       │
+  │                                           │
+  │  场景障碍物 (scene_objs)                  │
+  │    - 固定的几何体（cube/cylinder）         │
+  └──────────────────────────────────────────┘
+
+  关键物理参数（_create_obj_assets, 行 572-616）:
+  - vhacd_enabled = True + convex_decomposition_from_submeshes = 
+  True：物体自动凸分解，支持复杂形状碰撞
+  - override_com/inertia = True：允许修改质心和惯性张量
+  - 物体质量上限 500g（min(0.5, obj_props[0].mass)）
+
+  2.2 状态初始化（_reset_default, 行 1054-1163）
+
+  与 Imitator 最大的区别：使用重定向后的精确数据初始化。
+
+  # 手的初始化 — 使用 retarget 的结果
+  dof_pos = demo_data["opt_dof_pos"][env_ids, seq_idx]          # 
+  重定向后的关节角
+  opt_wrist_pos = demo_data["opt_wrist_pos"][env_ids, seq_idx]  # 
+  重定向后的手腕位置
+  opt_wrist_rot = demo_data["opt_wrist_rot"][env_ids, seq_idx]  # 
+  重定向后的手腕旋转
+  dof_vel = demo_data["opt_dof_velocity"][env_ids, seq_idx]     # 对应的速度
+
+  # 物体初始化 — 使用数据集中的精确轨迹
+  obj_pos = demo_data["obj_trajectory"][env_ids, seq_idx, :3, 3]
+  obj_rot = demo_data["obj_trajectory"][env_ids, seq_idx, :3, :3]
+  obj_vel = demo_data["obj_velocity"][env_ids, seq_idx]
+  obj_ang_vel = demo_data["obj_angular_velocity"][env_ids, seq_idx]
+
+  RSI（Random State Init）: 随机选择轨迹的某一帧作为起点（seq_idx = random(0, 
+  0.98 * seq_len)），手和物体同步初始化。
+
+  还有一个额外功能——接触历史缓存:
+  self.tips_contact_history = torch.ones(num_envs, 3, 5, device=...).bool()
+  记录最近 3 步中 5 个指尖是否有接触力，用于后续的失败检测。
+
+  ---
+  三、观察空间（Observation）
+
+  3.1 proprioception（本体感知）— 与 Imitator 相同
+
+  q:          [n_dofs]         关节角度
+  cos_q:      [n_dofs]         cos(关节角度)
+  sin_q:      [n_dofs]         sin(关节角度)
+  base_state: [0,0,0, quat(4), vel(3), ang_vel(3)]  手腕状态（位置被置零）
+
+  3.2 privileged（特权观察）
+
+  manip_obj_pos:    [3]           物体位置（相对手腕）
+  manip_obj_com:    [3]           物体质心（相对手腕）
+  manip_obj_quat:   [4]           物体四元数
+  manip_obj_vel:    [3]           物体线速度
+  manip_obj_ang_vel:[3]           物体角速度
+  manip_obj_weight: [1]           物体重力 (mass * g)
+  tip_force:        [5 * 4 = 20]  5 个接触体的力 + 力的模长
+
+  3.3 target（目标观察）— 比 Imitator 多很多
+
+  维度计算（行 138-160）：128 + 5 + (3+3+3+4+4+3+3 + (n_bodies-1)*9 + 
+  3+3+3+4+4+3+3 + n_bodies) * K
+
+  拆解每帧目标（K = obs_future_length 帧）：
+
+  手的部分（与 Imitator 相同）:
+  ┌─────────────────────┬──────────────────┬─────────────────────┐
+  │        字段         │       维度       │        含义         │
+  ├─────────────────────┼──────────────────┼─────────────────────┤
+  │ delta_wrist_pos     │ K*3              │ 目标手腕位置 - 当前 │
+  ├─────────────────────┼──────────────────┼─────────────────────┤
+  │ wrist_vel           │ K*3              │ 目标手腕速度        │
+  ├─────────────────────┼──────────────────┼─────────────────────┤
+  │ delta_wrist_vel     │ K*3              │ 速度差              │
+  ├─────────────────────┼──────────────────┼─────────────────────┤
+  │ wrist_quat          │ K*4              │ 目标手腕四元数      │
+  ├─────────────────────┼──────────────────┼─────────────────────┤
+  │ delta_wrist_quat    │ K*4              │ 旋转差              │
+  ├─────────────────────┼──────────────────┼─────────────────────┤
+  │ wrist_ang_vel       │ K*3              │ 目标角速度          │
+  ├─────────────────────┼──────────────────┼─────────────────────┤
+  │ delta_wrist_ang_vel │ K*3              │ 角速度差            │
+  ├─────────────────────┼──────────────────┼─────────────────────┤
+  │ delta_joints_pos    │ K*(n_bodies-1)*3 │ 各关节位置差        │
+  ├─────────────────────┼──────────────────┼─────────────────────┤
+  │ joints_vel          │ K*(n_bodies-1)*3 │ 各关节目标速度      │
+  ├─────────────────────┼──────────────────┼─────────────────────┤
+  │ delta_joints_vel    │ K*(n_bodies-1)*3 │ 关节速度差          │
+  └─────────────────────┴──────────────────┴─────────────────────┘
+  物体的部分（Residual 新增）:
+  ┌─────────────────────────┬──────┬─────────────────────┐
+  │          字段           │ 维度 │        含义         │
+  ├─────────────────────────┼──────┼─────────────────────┤
+  │ delta_manip_obj_pos     │ K*3  │ 目标物体位置 - 当前 │
+  ├─────────────────────────┼──────┼─────────────────────┤
+  │ manip_obj_vel           │ K*3  │ 目标物体速度        │
+  ├─────────────────────────┼──────┼─────────────────────┤
+  │ delta_manip_obj_vel     │ K*3  │ 物体速度差          │
+  ├─────────────────────────┼──────┼─────────────────────┤
+  │ manip_obj_quat          │ K*4  │ 目标物体四元数      │
+  ├─────────────────────────┼──────┼─────────────────────┤
+  │ delta_manip_obj_quat    │ K*4  │ 物体旋转差          │
+  ├─────────────────────────┼──────┼─────────────────────┤
+  │ manip_obj_ang_vel       │ K*3  │ 目标物体角速度      │
+  ├─────────────────────────┼──────┼─────────────────────┤
+  │ delta_manip_obj_ang_vel │ K*3  │ 物体角速度差        │
+  └─────────────────────────┴──────┴─────────────────────┘
+  几何信息（Residual 新增）:
+  ┌──────────────────┬──────────┬─────────────────────────────────┐
+  │       字段       │   维度   │              含义               │
+  ├──────────────────┼──────────┼─────────────────────────────────┤
+  │ obj_to_joints    │ n_bodies │ 物体到每个关节的距离            │
+  ├──────────────────┼──────────┼─────────────────────────────────┤
+  │ gt_tips_distance │ K*5      │ GT 五指尖到物体距离             │
+  ├──────────────────┼──────────┼─────────────────────────────────┤
+  │ bps              │ 128      │ 物体的 BPS 形状编码（固定不变） │
+  └──────────────────┴──────────┴─────────────────────────────────┘
+  ---
+  四、动作空间（Action）与 pre_physics_step
+
+  4.1 动作如何从网络到环境
+
+  网络输出的 actions 维度 = 2 * (6 + n_dofs)（非 PID 模式），前半是
+  base_action，后半是 residual_action。
+
+  pre_physics_step（行 1203-1326）拆分：
+
+  res_split_idx = actions.shape[1] // 2  # 正好对半分
+  base_action    = actions[:, :res_split_idx]       # 范围 [-1, 1]
+  residual_action = actions[:, res_split_idx:] * 2  # 范围 [-2, 
+  2]（放大残差空间）
+
+  4.2 手指关节控制
+
+  # base + residual 叠加
+  dof_pos = 1.0 * base_action[:, 6:6+n_dofs] + residual_action[:, 6:6+n_dofs]
+  dof_pos = clamp(dof_pos, -1, 1)
+
+  # 映射到关节限位范围
+  curr_targets = scale(dof_pos, lower_limits, upper_limits)
+
+  # 指数移动平均平滑
+  curr_targets = α * curr_targets + (1-α) * prev_targets  # α = 0.4
+
+  # 设置位置控制目标
+  gym.set_dof_position_target_tensor(...)
+
+  4.3 手腕力/扭矩控制
+
+  非 PID 模式（主要方法，行 1297-1314）:
+
+  # base 和 residual 对手腕力的贡献直接相加
+  force  = 1.0 * (base_action[:, 0:3] * dt * translation_scale * 500)
+         + (residual_action[:, 0:3] * dt * translation_scale * 500)
+
+  torque = 1.0 * (base_action[:, 3:6] * dt * orientation_scale * 200)
+         + (residual_action[:, 3:6] * dt * orientation_scale * 200)
+
+  # 指数移动平均平滑
+  apply_forces[wrist] = α * force + (1-α) * apply_forces[wrist]
+
+  # 施加力和扭矩
+  gym.apply_rigid_body_force_tensors(forces, torques, ENV_SPACE)
+
+  PID 模式（行 1267-1295，备选方法）:
+
+  # base_action 通过 PID 产生力
+  force_pid = Kp * base_pos_err + Ki * integral + Kd * derivative
+  # residual 直接叠加额外的力
+  force = force_pid + residual_action[:, 0:3] * dt * scale * 500
+
+  4.4 整个 step 循环
+
+  step(actions)
+    ├── pre_physics_step(actions)      ← 拆分 base/residual，施加力和关节目标
+    │     ├── 力/扭矩 → apply_rigid_body_force_tensors
+    │     └── 关节目标 → set_dof_position_target_tensor
+    ├── gym.simulate(sim)              ← IsaacGym 物理仿真一步
+    ├── post_physics_step()
+    │     ├── compute_observations()   ← 刷新状态，构建 obs_dict
+    │     └── compute_reward()         ← 计算奖励和终止条件
+    └── return obs, reward, done, info
+
+  ---
+  五、奖励函数详解
+
+  compute_imitation_reward（行 1412-1597）。与 Imitator
+  相比，新增了物体跟踪奖励和接触力奖励。
+
+  5.1 所有奖励项
+  ┌──────────────────────────────┬──────┬────────┬────────────────────────┐
+  │            奖励项            │ 系数 │ 衰减 k │          含义          │
+  ├──────────────────────────────┼──────┼────────┼────────────────────────┤
+  │ 手的跟踪（与 Imitator 相同） │      │        │                        │
+  ├──────────────────────────────┼──────┼────────┼────────────────────────┤
+  │ reward_eef_pos               │ 0.1  │ 40     │ 手腕位置               │
+  ├──────────────────────────────┼──────┼────────┼────────────────────────┤
+  │ reward_eef_rot               │ 0.6  │ 1      │ 手腕旋转               │
+  ├──────────────────────────────┼──────┼────────┼────────────────────────┤
+  │ reward_thumb_tip_pos         │ 0.9  │ 100    │ 拇指指尖               │
+  ├──────────────────────────────┼──────┼────────┼────────────────────────┤
+  │ reward_index_tip_pos         │ 0.8  │ 90     │ 食指指尖               │
+  ├──────────────────────────────┼──────┼────────┼────────────────────────┤
+  │ reward_middle_tip_pos        │ 0.75 │ 80     │ 中指指尖               │
+  ├──────────────────────────────┼──────┼────────┼────────────────────────┤
+  │ reward_ring_tip_pos          │ 0.6  │ 60     │ 无名指指尖             │
+  ├──────────────────────────────┼──────┼────────┼────────────────────────┤
+  │ reward_pinky_tip_pos         │ 0.6  │ 60     │ 小指指尖               │
+  ├──────────────────────────────┼──────┼────────┼────────────────────────┤
+  │ reward_level_1_pos           │ 0.5  │ 50     │ 关键近端关节           │
+  ├──────────────────────────────┼──────┼────────┼────────────────────────┤
+  │ reward_level_2_pos           │ 0.3  │ 40     │ 其他关节               │
+  ├──────────────────────────────┼──────┼────────┼────────────────────────┤
+  │ reward_eef_vel               │ 0.1  │ 1      │ 手腕速度匹配           │
+  ├──────────────────────────────┼──────┼────────┼────────────────────────┤
+  │ reward_eef_ang_vel           │ 0.05 │ 1      │ 手腕角速度             │
+  ├──────────────────────────────┼──────┼────────┼────────────────────────┤
+  │ reward_joints_vel            │ 0.1  │ 1      │ 关节速度               │
+  ├──────────────────────────────┼──────┼────────┼────────────────────────┤
+  │ 物体跟踪（Residual 新增）    │      │        │                        │
+  ├──────────────────────────────┼──────┼────────┼────────────────────────┤
+  │ reward_obj_pos               │ 5.0  │ 80     │ 物体位置（最高权重！） │
+  ├──────────────────────────────┼──────┼────────┼────────────────────────┤
+  │ reward_obj_rot               │ 1.0  │ 3      │ 物体旋转               │
+  ├──────────────────────────────┼──────┼────────┼────────────────────────┤
+  │ reward_obj_vel               │ 0.1  │ 1      │ 物体速度               │
+  ├──────────────────────────────┼──────┼────────┼────────────────────────┤
+  │ reward_obj_ang_vel           │ 0.1  │ 1      │ 物体角速度             │
+  ├──────────────────────────────┼──────┼────────┼────────────────────────┤
+  │ 接触力（Residual 新增）      │      │        │                        │
+  ├──────────────────────────────┼──────┼────────┼────────────────────────┤
+  │ reward_finger_tip_force      │ 1.0  │ 特殊   │ 接触力（见下文）       │
+  ├──────────────────────────────┼──────┼────────┼────────────────────────┤
+  │ 能耗惩罚                     │      │        │                        │
+  ├──────────────────────────────┼──────┼────────┼────────────────────────┤
+  │ reward_power                 │ 0.5  │ 10     │ 关节功率               │
+  ├──────────────────────────────┼──────┼────────┼────────────────────────┤
+  │ reward_wrist_power           │ 0.5  │ 2      │ 手腕功率               │
+  └──────────────────────────────┴──────┴────────┴────────────────────────┘
+  reward_obj_pos 的系数是 5.0，是所有奖励项中最大的——这说明物体位置跟踪是
+  Residual 阶段最重要的目标。
+
+  5.2 接触力奖励（行 1509-1517）
+
+  # 只在人手指尖离物体近（2-3cm）时才要求接触
+  finger_tip_weight = clamp((0.03 - gt_distance) / (0.03 - 0.02), 0, 1)
+  # 加权后的接触力
+  force_masked = tip_force * finger_tip_weight
+  # 奖励：鼓励更大的接触力
+  reward = exp(-1 / (||force_masked|| + ε))
+
+  含义：当人手数据显示指尖离物体近时（<
+  3cm），奖励灵巧手也产生接触力。距离越近权重越大（2cm 时权重=1，3cm
+  时权重=0）。
+
+  5.3 失败条件（行 1528-1542）
+
+  比 Imitator 多了物体相关的失败条件：
+
+  failed = (
+      obj_pos_error > 0.058 * scale_factor³     # 
+  物体位置偏差（注意是三次方！更严格）
+      or obj_rot_error > 87° * scale_factor³     # 物体旋转偏差
+      or thumb_tip_error > 0.057 * scale_factor  # 各指尖偏差（同 Imitator）
+      or ...
+      # 新增：如果指尖距离很近(<5mm)但最近3步都没检测到接触力 → 穿模了！
+      or (tips_distance < 0.005 and no_contact_in_last_3_steps)
+  ) and running_steps >= 8  # 前 8 步不判定失败
+
+  穿模检测是关键创新点（行 1539）：
+  (finger_tip_distance < 0.005) & ~(tip_contact_state.any(1))
+  如果指尖离物体表面 < 5mm 但过去 3 步都没有接触力信号，说明手穿过了物体 →
+  终止。
+
+  5.4 Tighten 机制
+
+  scale_factor 随训练步数逐渐减小（从 1.0 →
+  tighten_factor），使得失败阈值越来越严格：
+
+  # 以 exp_decay 为例
+  scale_factor = (e*2)^(-step/tighten_steps) * (1 - factor) + factor
+
+  训练初期容忍大误差，后期要求精确跟踪。
+
+  ---
+  六、网络架构
+
+  6.1 两层模型结构
+
+  ┌─────────────────────────────────────────────────────┐
+  │  ModelA2CContinuousLogStdResRH  (res_models.py)      │
+  │                                                      │
+  │  ┌──────────────────────────────────────┐            │
+  │  │ base_model (冻结的 Imitator)          │            │
+  │  │   - 有自己的 RunningMeanStdObs       │            │
+  │  │   - input: imitator 尺寸的 obs        │            │
+  │  │   - 永远 eval() 模式                 │            │
+  │  └──────────────────────────────────────┘            │
+  │                                                      │
+  │  ┌──────────────────────────────────────┐            │
+  │  │ a2c_network (可训练的残差网络)         │            │
+  │  │   ResRHDictObsNetwork                │            │
+  │  │   - 有自己的 RunningMeanStdObs       │            │
+  │  │   - input: 完整的 obs (比 imitator 大)│            │
+  │  └──────────────────────────────────────┘            │
+  └─────────────────────────────────────────────────────┘
+
+  6.2 观察分流（res_models.py:71-79）
+
+  def forward(self, input_dict):
+      # 从完整观察中截取 imitator 需要的部分
+      base_model_obs = {
+          k: v[:, :base_model_obs_shape[k]]    # 取前 N 维（imitator 尺寸）
+          for k, v in input_dict["obs"].items()
+      }
+
+      # 两套独立的归一化
+      base_model_obs = self.base_model.norm_obs(base_model_obs)   # imitator 
+  的归一化
+      input_dict["obs"] = self.norm_obs(input_dict["obs"])         # 
+  残差网络的归一化
+
+      mu, logstd, value, states, base_action = self.a2c_network(
+          input_dict,       # 完整 obs → 残差网络
+          base_model_obs,   # 截取的 obs → imitator
+      )
+
+  残差环境的 obs 比 imitator 多了物体状态、BPS 等维度。通过 [:, :base_shape]
+  截取前面和 imitator 同维度的部分给 base_model。
+
+  6.3 残差网络前向传播（network_builder_residual_sh.py:134-181）
+
+  def forward(self, obs_dict, base_obs_dict):
+      # 1. 编码完整观察
+      obs = self.dict_feature_encoder(obs)      # 特征提取
+
+      # 2. 冻结的 imitator 推理
+      base_mu, base_logstd, _, _ = self.base_model(base_obs_dict)
+      base_sigma = exp(base_logstd)
+      base_action = Normal(base_mu, base_sigma).sample()  # 采样（有随机性）
+
+      # 3. 残差网络：观察特征 + base_action 一起输入 MLP
+      out = cat([obs, base_action], dim=1)  # 拼接
+      out = self.actor_mlp(out)
+
+      # 4. 输出残差策略的 mu 和 sigma
+      mu = self.mu(out)        # 残差动作的均值
+      sigma = self.sigma       # 固定标准差（可学习参数）
+
+      return mu, sigma, value, states, base_action
+
+  MLP 输入维度 = feature_dim + base_action_dim（行 37-39）。
+
+  6.4 动作拼接（res_models.py:96-106）
+
+  # 推理时（is_train=False）
+  selected_action = Normal(mu, sigma).sample()   # 残差动作
+  result = {
+      "actions": selected_action,     # 残差 MLP 的输出
+      "base_actions": base_action,    # imitator 的输出
+  }
+
+  最终环境收到的 actions tensor = cat([base_action, selected_action]) ，在
+  pre_physics_step 中对半拆分。
+
+  ---
+  七、完整数据流图
+
+            ┌─────────────── obs_dict ───────────────┐
+            │  proprioception: [q, cos_q, sin_q, ...]│
+            │  target: [delta_wrist, delta_obj, bps..]│
+            │  privileged: [obj_pos, tip_force, ...]  │
+            └────────┬────────────────┬───────────────┘
+                     │                │
+      ┌──────────────▼──────┐  ┌─────▼──────────────────────┐
+      │ 截取前 N 维给 base  │  │  完整 obs → feature encoder │
+      │                     │  │                             │
+      │ base_model (冻结)   │  │  encoded_features           │
+      │  ↓                  │  │        │                    │
+      │ base_mu, base_sigma │  │        │                    │
+      │  ↓                  │  │        │                    │
+      │ base_action=sample()│  │        │                    │
+      └────────┬────────────┘  └────────┤                    │
+               │                        │                    │
+               └──────── cat ───────────┘                    │
+                          │                                  │
+                          ▼                                  │
+                ┌─────────────────┐                          │
+                │  actor_mlp      │                          │
+                │  (可训练)       │                          │
+                └────────┬────────┘                          │
+                         │                                   │
+                         ▼                                   │
+                residual_mu, sigma                           │
+                         │                                   │
+                         ▼                                   │
+                residual_action = sample()                   │
+                         │                                   │
+       actions = cat([base_action, residual_action])         │
+                         │                                   │
+                         ▼                                   │
+      ┌──────────────────────────────────────────────────┐   │
+      │  pre_physics_step (环境)                          │   │
+      │                                                  │   │
+      │  base_action = actions[:, :half]                 │   │
+      │  residual_action = actions[:, half:] * 2         │   │
+      │                                                  │   │
+      │  force  = base[0:3]*scale + residual[0:3]*scale  │   │
+      │  torque = base[3:6]*scale + residual[3:6]*scale  │   │
+      │  dof    = base[6:] + residual[6:]                │   │
+      │                                                  │   │
+      │  → apply_rigid_body_force_tensors (手腕)         │   │
+      │  → set_dof_position_target_tensor (手指)         │   │
+      └──────────────────────────────────────────────────┘   │
+                         │                                   │
+                         ▼                                   │
+                IsaacGym simulate()                          │
+                         │                                   │
+                         ▼                                   │
+                post_physics_step()                          │
+                ├── compute_observations() ─────────────────►│
+                └── compute_reward()
+                         │
+                         ▼
+                reward = 手跟踪 + 5.0*物体位置 + 接触力 + ...
+
+  ---
+  八、一些关键设计细节
+
+  8.1 为什么 residual_action 乘以 2？
+
+  residual_action = actions[:, res_split_idx:] * 2
+
+  残差网络的 mu 经过 tanh 激活（mu_activation: tanh），输出在 [-1, 1]。乘以 2
+  使残差空间为 [-2, 2]，比 base 的 [-1, 1] 更大——让残差有足够的修正能力。
+
+  8.2 base_action 用 sample() 而非 mu
+
+  base_action = Normal(base_mu, base_sigma).sample()
+
+  从分布采样而非直接用均值，引入随机性。这使残差网络学会在 base
+  的随机变化上适应，增强鲁棒性。
+
+  8.3 双手策略（BiH）的特殊处理
+
+  在 res_models.py:293-310（ModelA2CContinuousLogStdResBiH）:
+
+  # 右手 base model 取 obs 的前半部分
+  rh_base_model_obs = {k: v[:, :shape] for k, v in obs.items()}
+  # 左手 base model 取 obs 的后半部分
+  lh_base_model_obs = {k: v[:, half:half+shape] for k, v in obs.items()}
+
+  BiH 模式下有两个冻结的 imitator（左手和右手各一个），分别处理各自的观察。
+
+  如果需要进一步了解某个具体模块，告诉我即可。
+
+✻ Cooked for 2m 21s
+
+❯ 指尖的接触力是如何获得的，数据集中有实际的值可以用来参考计算接触力的差吗  
+  ？                                                                        
+
+● 好问题。让我从代码中精确追踪接触力的来源和使用方式。
+
+  1. 接触力的来源：IsaacGym 物理仿真
+
+  接触力不是来自数据集，而是 IsaacGym 仿真器在物理模拟过程中实时计算的。
+
+  在 dexhandmanip_sh.py:445-471 初始化时：
+
+  _net_cf = self.gym.acquire_net_contact_force_tensor(self.sim)
+  self.net_cf = gymtorch.wrap_tensor(_net_cf).view(self.num_envs, -1, 3)
+
+  net_contact_force_tensor 是 IsaacGym 的内置
+  API，返回每个刚体在当前仿真步受到的净接触力（3D 向量，单位 N）。它是 PhysX
+  引擎在碰撞检测和约束求解后自动计算的结果。
+
+  每步仿真后通过 refresh 更新（行 763）：
+
+  self.gym.refresh_net_contact_force_tensor(self.sim)
+
+  然后在 compute_reward 中提取 5 个指尖接触体的力（行 795-806）：
+
+  # contact_body_names 例如 Inspire: ["thumb_distal", "index_intermediate", ...]
+  tip_force = torch.stack(
+      [self.net_cf[:, self.dexhand_handles[k], :] for k in
+  self.dexhand.contact_body_names],
+      axis=1,
+  )  # [num_envs, 5, 3]
+
+  # 记录过去 3 步的接触状态（有力 → True）
+  self.tips_contact_history = concat([
+      self.tips_contact_history[:, 1:],                          # 丢弃最旧一步
+      (torch.norm(tip_force, dim=-1) > 0)[:, None],             # 新增当前步
+  ], dim=1)  # [num_envs, 3, 5]
+
+  简单来说：力的模长 > 0 就认为有接触。
+
+  2. 数据集中没有接触力，只有指尖距离
+
+  数据集提供的是 tips_distance——人手 MANO 五个指尖到物体表面的 Chamfer
+  距离（base.py:119-127）：
+
+  tip_list = ["thumb_tip", "index_tip", "middle_tip", "ring_tip", "pinky_tip"]
+  tips = cat([mano_joints[t][:, None] for t in tip_list], dim=1)  # [T, 5, 3]
+  tips_near, _, _, _ = chamfer_distance(tips, obj_verts)           # 最近点距离²
+  data["tips_distance"] = sqrt(tips_near)                          # [T, 
+  5]，单位 m
+
+  这是纯几何距离，不是力。数据集里没有任何力的数值。
+
+  3. 接触力奖励的实际计算逻辑
+
+  奖励函数（行 1509-1517）做的事是：用数据集的距离来决定"什么时候该有接触力"，用
+  仿真的力来衡量"实际有没有接触力"。
+
+  # 从数据集获取：人手指尖在这一帧离物体多近
+  finger_tip_distance = target_states["tips_distance"]    # [N, 5], 来自数据集
+
+  # 从仿真获取：灵巧手指尖实际的接触力
+  finger_tip_force = target_states["tip_force"]           # [N, 5, 3], 来自 
+  IsaacGym
+
+  # 关键：用距离生成权重掩码
+  contact_range = [0.02, 0.03]  # 2cm~3cm
+  finger_tip_weight = clamp(
+      (0.03 - finger_tip_distance) / (0.03 - 0.02),
+      0, 1
+  )
+  # distance < 2cm → weight = 1（人手几乎接触物体，强烈期望有力）
+  # distance = 2.5cm → weight = 0.5（过渡区）
+  # distance > 3cm → weight = 0（人手离物体远，不要求接触）
+
+  # 加权后的力
+  finger_tip_force_masked = finger_tip_force * finger_tip_weight[:, :, None]
+
+  # 奖励：鼓励被掩码保留的指尖产生更大接触力
+  reward = exp(-1 / (||force_masked||_sum + 1e-5))
+
+  所以逻辑是：
+  - 不是让仿真力去匹配数据集的力（数据集没有力）
+  - 而是：当数据集告诉我们"人手的指尖离物体很近"时，奖励灵巧手的指尖也产生接触力
+
+  这是一种间接监督：距离作为代理信号指导接触。
+
+  4. 接触力在穿模检测中的用途
+
+  除了奖励，接触力还用于检测穿模（行 1539）：
+
+  # 如果灵巧手指尖离物体 < 5mm，但过去 3 步都没检测到接触力
+  # → 手穿过了物体（物理上不可能近距离无力）→ 判定失败
+  (finger_tip_distance < 0.005) & ~(tip_contact_state.any(dim=1))
+
+  这里 finger_tip_distance 是数据集的 GT
+  距离（表示人手应该在那个位置），tip_contact_state
+  是仿真的实际接触。如果人手应该很近但灵巧手却没产生接触力，说明出了物理错误。
+
+  5. 总结
+  数据来源: 数据集 (tips_distance)
+  内容: 人手指尖到物体的几何距离 [T, 5]
+  用途: 决定"什么时候该有接触力"（权重掩码）
+  ────────────────────────────────────────
+  数据来源: IsaacGym 仿真 (net_cf)
+  内容: 灵巧手刚体的净接触力 [N, n_bodies, 3]
+  用途: 实际接触力数值，用于奖励和穿模检测
+  数据集中不存在可以直接对比的接触力参考值。接触力完全是物理仿真的产物，奖励设计
+  巧妙地用距离→权重→力→奖励这个链条间接引导策略学会在正确时机产生接触。
+
+✻ Crunched for 40s
+
+❯ how to export the current chat? 
+
+● claude-code-guide(Export chat conversation method) Haiku 4.5
+  ⎿  Done (3 tool uses · 25.3k tokens · 17s)
+
+● You can export this conversation using the built-in /export command:
+
+  - /export — copies the conversation to your clipboard
+  - /export filename.md — saves to a file
+
+✻ Brewed for 31s
