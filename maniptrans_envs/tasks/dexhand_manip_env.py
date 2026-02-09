@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import torch
 import numpy as np
+import xml.etree.ElementTree as ET
 from collections.abc import Sequence
 from dataclasses import MISSING
 from typing import Dict, List, Tuple, Any
@@ -340,6 +341,15 @@ class DexHandManipEnv(DirectRLEnv):
         self._actual_num_bodies = len(actual_body_names)
         self._actual_num_joints = len(actual_joint_names)
 
+        # Find wrist body index by name (instead of assuming index 0)
+        wrist_body_name = self.dexhand.to_dex("wrist")[0]
+        if wrist_body_name in self.body_name_to_idx:
+            self.wrist_body_idx = self.body_name_to_idx[wrist_body_name]
+        else:
+            print(f"[WARNING] Wrist body '{wrist_body_name}' not found in articulation, falling back to index 0")
+            self.wrist_body_idx = 0
+        print(f"[INFO] Wrist body index: {self.wrist_body_idx} (name: {wrist_body_name})")
+
         # Verify joint count matches expected
         if self._actual_num_joints != self.dexhand.n_dofs:
             print(f"[WARNING] Joint count mismatch! IsaacLab has {self._actual_num_joints} joints, expected {self.dexhand.n_dofs}")
@@ -354,29 +364,36 @@ class DexHandManipEnv(DirectRLEnv):
         # Use actual joint count from IsaacLab articulation
         num_joints = self._actual_num_joints if hasattr(self, '_actual_num_joints') else self.dexhand.n_dofs
 
-        # Initialize joint limits from URDF values (in IsaacLab breadth-first order)
-        # IsaacLab order: [index_prox, middle_prox, pinky_prox, ring_prox, thumb_yaw,
-        #                  index_inter, middle_inter, pinky_inter, ring_inter,
-        #                  thumb_pitch, thumb_inter, thumb_distal]
-        # These must be set correctly for proper scaling of actions
-        if self.cfg.dexhand_type == "inspire":
-            lower = [0.0, 0.0, 0.0, 0.0, -0.1,  # proximal joints + thumb yaw
-                     0.0, 0.0, 0.0, 0.0,         # intermediate joints
-                     0.0, 0.0, 0.0]              # thumb pitch/inter/distal
-            upper = [1.7, 1.7, 1.7, 1.7, 1.3,    # proximal joints + thumb yaw
-                     1.7, 1.7, 1.7, 1.7,         # intermediate joints
-                     0.5, 0.8, 1.2]              # thumb pitch/inter/distal
-            self.dexhand_dof_lower_limits = torch.tensor(lower, device=self.device, dtype=torch.float32)
-            self.dexhand_dof_upper_limits = torch.tensor(upper, device=self.device, dtype=torch.float32)
-        else:
-            # Fallback to reading from articulation data
-            try:
-                self.dexhand_dof_lower_limits = self.hand.data.soft_joint_pos_limits[0, :, 0].clone()
-                self.dexhand_dof_upper_limits = self.hand.data.soft_joint_pos_limits[0, :, 1].clone()
-            except:
-                # Default if not available
-                self.dexhand_dof_lower_limits = torch.full((num_joints,), -1.57, device=self.device, dtype=torch.float32)
-                self.dexhand_dof_upper_limits = torch.full((num_joints,), 1.57, device=self.device, dtype=torch.float32)
+        # Read joint limits from URDF (in IsaacLab order, which may differ from dexhand.dof_names order)
+        urdf_path = self.dexhand.urdf_path
+        tree = ET.parse(urdf_path)
+        urdf_root = tree.getroot()
+        urdf_joint_limits = {}
+        for joint_elem in urdf_root.findall('.//joint'):
+            jname = joint_elem.get('name')
+            limit_elem = joint_elem.find('limit')
+            if limit_elem is not None and joint_elem.get('type') in ('revolute', 'prismatic', 'continuous'):
+                urdf_joint_limits[jname] = (
+                    float(limit_elem.get('lower', '-1.5708')),
+                    float(limit_elem.get('upper', '1.5708')),
+                )
+
+        # Build limits in IsaacLab joint order (actual_joint_names)
+        actual_joint_names = self.hand.joint_names
+        lower_limits = []
+        upper_limits = []
+        for jname in actual_joint_names:
+            if jname in urdf_joint_limits:
+                lo, hi = urdf_joint_limits[jname]
+                lower_limits.append(lo)
+                upper_limits.append(hi)
+            else:
+                print(f"[WARNING] Joint '{jname}' not found in URDF limits, using [-pi/2, pi/2]")
+                lower_limits.append(-1.5708)
+                upper_limits.append(1.5708)
+
+        self.dexhand_dof_lower_limits = torch.tensor(lower_limits, device=self.device, dtype=torch.float32)
+        self.dexhand_dof_upper_limits = torch.tensor(upper_limits, device=self.device, dtype=torch.float32)
 
         print(f"[INFO] Joint limits (IsaacLab order):")
         print(f"[INFO]   Lower: {self.dexhand_dof_lower_limits.tolist()}")
@@ -734,13 +751,13 @@ class DexHandManipEnv(DirectRLEnv):
         self.prev_rot_error = rotation_error
         torque = torque + residual_action[:, 3:6] * self.physics_dt * self.orientation_scale * 200
 
-        self.apply_forces[:, 0, :] = (
+        self.apply_forces[:, self.wrist_body_idx, :] = (
             self.act_moving_average * force
-            + (1.0 - self.act_moving_average) * self.apply_forces[:, 0, :]
+            + (1.0 - self.act_moving_average) * self.apply_forces[:, self.wrist_body_idx, :]
         )
-        self.apply_torques[:, 0, :] = (
+        self.apply_torques[:, self.wrist_body_idx, :] = (
             self.act_moving_average * torque
-            + (1.0 - self.act_moving_average) * self.apply_torques[:, 0, :]
+            + (1.0 - self.act_moving_average) * self.apply_torques[:, self.wrist_body_idx, :]
         )
 
     def _apply_force_control(self, base_action, residual_action):
@@ -754,13 +771,13 @@ class DexHandManipEnv(DirectRLEnv):
             + (residual_action[:, 3:6] * self.physics_dt * self.orientation_scale * 200)
         )
 
-        self.apply_forces[:, 0, :] = (
+        self.apply_forces[:, self.wrist_body_idx, :] = (
             self.act_moving_average * force
-            + (1.0 - self.act_moving_average) * self.apply_forces[:, 0, :]
+            + (1.0 - self.act_moving_average) * self.apply_forces[:, self.wrist_body_idx, :]
         )
-        self.apply_torques[:, 0, :] = (
+        self.apply_torques[:, self.wrist_body_idx, :] = (
             self.act_moving_average * torque
-            + (1.0 - self.act_moving_average) * self.apply_torques[:, 0, :]
+            + (1.0 - self.act_moving_average) * self.apply_torques[:, self.wrist_body_idx, :]
         )
 
     def _get_observations(self) -> dict:

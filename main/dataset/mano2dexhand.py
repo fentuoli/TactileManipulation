@@ -14,6 +14,7 @@ import math
 import os
 import pickle
 import logging
+import xml.etree.ElementTree as ET
 
 import numpy as np
 import pytorch_kinematics as pk
@@ -91,14 +92,35 @@ class Mano2Dexhand:
         # Get joint names from chain
         self.joint_names = self.chain.get_joint_parameter_names()
 
-        # Setup joint limits (will be updated if URDF has limits)
-        n_dofs = len(self.joint_names)
-        self.dexhand_dof_lower_limits = torch.full(
-            (n_dofs,), -np.pi, device=self.device, dtype=torch.float32
-        )
-        self.dexhand_dof_upper_limits = torch.full(
-            (n_dofs,), np.pi, device=self.device, dtype=torch.float32
-        )
+        # Parse joint limits from URDF
+        tree = ET.parse(urdf_path)
+        urdf_root = tree.getroot()
+        urdf_joint_limits = {}
+        for joint_elem in urdf_root.findall('.//joint'):
+            jname = joint_elem.get('name')
+            limit_elem = joint_elem.find('limit')
+            if limit_elem is not None and joint_elem.get('type') in ('revolute', 'prismatic', 'continuous'):
+                urdf_joint_limits[jname] = (
+                    float(limit_elem.get('lower', str(-np.pi))),
+                    float(limit_elem.get('upper', str(np.pi))),
+                )
+
+        # Build limits in dexhand.dof_names order
+        lower_limits = []
+        upper_limits = []
+        for dof_name in dexhand.dof_names:
+            if dof_name in urdf_joint_limits:
+                lo, hi = urdf_joint_limits[dof_name]
+                lower_limits.append(lo)
+                upper_limits.append(hi)
+            else:
+                cprint(f"[WARNING] Joint '{dof_name}' not found in URDF limits, using [-pi, pi]", "yellow")
+                lower_limits.append(-np.pi)
+                upper_limits.append(np.pi)
+
+        self.dexhand_dof_lower_limits = torch.tensor(lower_limits, device=self.device, dtype=torch.float32)
+        self.dexhand_dof_upper_limits = torch.tensor(upper_limits, device=self.device, dtype=torch.float32)
+        cprint(f"[INFO] Joint limits from URDF: lower={lower_limits}, upper={upper_limits}", "cyan")
 
         # Default DOF positions
         default_dof_pos = np.ones(dexhand.n_dofs) * np.pi / 50
@@ -124,24 +146,19 @@ class Mano2Dexhand:
             mujoco2gym_transf, device=self.device, dtype=torch.float32
         )
 
-        # Map from dexhand DOF ordering to chain ordering
-        # Try to match joint names between dexhand and chain
+        # Map from FK chain joint order -> dexhand.dof_names index
+        # Equivalent to original ManipTrans:
+        #   [self.gym.get_actor_dof_names(...).index(j) for j in self.chain.get_joint_parameter_names()]
+        dof_name_list = list(dexhand.dof_names)
         self.isaac2chain_order = []
-        for joint_name in self.joint_names:
-            # Find matching dexhand DOF
-            found = False
-            for i, dof_name in enumerate(dexhand.dof_names):
-                if dof_name in joint_name or joint_name in dof_name:
-                    self.isaac2chain_order.append(i)
-                    found = True
-                    break
-            if not found:
-                # Default: use index
-                self.isaac2chain_order.append(len(self.isaac2chain_order))
-
-        # If ordering doesn't match, use identity
-        if len(self.isaac2chain_order) != dexhand.n_dofs:
-            self.isaac2chain_order = list(range(min(len(self.joint_names), dexhand.n_dofs)))
+        for j in self.joint_names:
+            if j in dof_name_list:
+                self.isaac2chain_order.append(dof_name_list.index(j))
+            else:
+                raise ValueError(
+                    f"FK chain joint '{j}' not found in dexhand.dof_names: {dof_name_list}"
+                )
+        cprint(f"[INFO] isaac2chain_order: {self.isaac2chain_order}", "cyan")
 
     def fitting(self, max_iter, obj_trajectory, target_wrist_pos, target_wrist_rot, target_mano_joints):
         """
@@ -224,13 +241,8 @@ class Mano2Dexhand:
                 self.dexhand_dof_upper_limits[:opt_dof_pos.shape[1]],
             )
 
-            # Forward kinematics
-            # Reorder DOFs for the chain
-            chain_dof_pos = opt_dof_pos_clamped
-            if len(self.isaac2chain_order) > 0:
-                chain_dof_pos = opt_dof_pos_clamped[:, :len(self.isaac2chain_order)]
-
-            ret = self.chain.forward_kinematics(chain_dof_pos)
+            # Forward kinematics (reorder DOFs from dexhand order to chain/URDF order)
+            ret = self.chain.forward_kinematics(opt_dof_pos_clamped[:, self.isaac2chain_order])
 
             # Get joint positions from FK
             pk_joints = []
@@ -279,12 +291,8 @@ class Mano2Dexhand:
             self.dexhand_dof_upper_limits[:opt_dof_pos.shape[1]],
         )
 
-        # Get final joint positions
-        chain_dof_pos = opt_dof_pos_clamped
-        if len(self.isaac2chain_order) > 0:
-            chain_dof_pos = opt_dof_pos_clamped[:, :len(self.isaac2chain_order)]
-
-        ret = self.chain.forward_kinematics(chain_dof_pos)
+        # Get final joint positions (reorder DOFs from dexhand order to chain/URDF order)
+        ret = self.chain.forward_kinematics(opt_dof_pos_clamped[:, self.isaac2chain_order])
         pk_joints = []
         for body_name in self.dexhand.body_names:
             if body_name in ret:
