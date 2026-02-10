@@ -22,6 +22,8 @@ from isaaclab.app import AppLauncher
 parser = argparse.ArgumentParser(description="Train ManipTrans RL agent with RL-Games.")
 
 # Environment configuration
+parser.add_argument("--mode", type=str, default="residual", choices=["imitator", "residual"],
+                    help="Training mode: imitator (hand-only tracking) or residual (hand+object manipulation)")
 parser.add_argument("--dexhand", type=str, default="inspire", help="Dexhand type (inspire, shadow, allegro, etc.)")
 parser.add_argument("--side", type=str, default="right", choices=["left", "right", "RH", "LH"], help="Hand side")
 parser.add_argument("--num_envs", type=int, default=4096, help="Number of environments to simulate.")
@@ -107,10 +109,15 @@ register_maniptrans_envs()
 
 def load_agent_cfg(args) -> dict:
     """Load RL-Games agent configuration."""
-    # Load default config from package
+    # Select config file based on training mode
+    if args.mode == "imitator":
+        config_filename = "rl_games_imitator_ppo_cfg.yaml"
+    else:
+        config_filename = "rl_games_ppo_cfg.yaml"
+
     config_path = os.path.join(
         os.path.dirname(__file__),
-        "../../maniptrans_envs/tasks/agents/rl_games_ppo_cfg.yaml"
+        f"../../maniptrans_envs/tasks/agents/{config_filename}"
     )
 
     with open(config_path, "r") as f:
@@ -134,18 +141,27 @@ def load_agent_cfg(args) -> dict:
 
 def main():
     """Train with RL-Games agent."""
-    # Load environment config
-    from maniptrans_envs.tasks.dexhand_manip_env import (
-        DexHandManipEnvCfg, DexHandManipRHEnvCfg, DexHandManipLHEnvCfg
-    )
-
-    # Select config based on side
-    if args_cli.side == "right":
-        env_cfg = DexHandManipRHEnvCfg()
-        task_name = "ManipTrans-DexHand-RH-Direct-v0"
+    # Select environment config and task based on mode
+    if args_cli.mode == "imitator":
+        from maniptrans_envs.tasks.dexhand_imitator_env import (
+            DexHandImitatorEnvCfg, DexHandImitatorRHEnvCfg, DexHandImitatorLHEnvCfg
+        )
+        if args_cli.side == "right":
+            env_cfg = DexHandImitatorRHEnvCfg()
+            task_name = "ManipTrans-DexHand-Imitator-RH-Direct-v0"
+        else:
+            env_cfg = DexHandImitatorLHEnvCfg()
+            task_name = "ManipTrans-DexHand-Imitator-LH-Direct-v0"
     else:
-        env_cfg = DexHandManipLHEnvCfg()
-        task_name = "ManipTrans-DexHand-LH-Direct-v0"
+        from maniptrans_envs.tasks.dexhand_manip_env import (
+            DexHandManipEnvCfg, DexHandManipRHEnvCfg, DexHandManipLHEnvCfg
+        )
+        if args_cli.side == "right":
+            env_cfg = DexHandManipRHEnvCfg()
+            task_name = "ManipTrans-DexHand-RH-Direct-v0"
+        else:
+            env_cfg = DexHandManipLHEnvCfg()
+            task_name = "ManipTrans-DexHand-LH-Direct-v0"
 
     # Override configurations from command line
     env_cfg.scene.num_envs = args_cli.num_envs
@@ -219,8 +235,10 @@ def main():
 
     # Print configuration summary
     print(f"[INFO] Configuration:")
+    print(f"  Mode: {args_cli.mode}")
     print(f"  Dexhand: {args_cli.dexhand}")
     print(f"  Side: {args_cli.side}")
+    print(f"  Task: {task_name}")
     print(f"  Num envs: {args_cli.num_envs}")
     print(f"  Data indices: {args_cli.data_indices}")
     print(f"  Learning rate: {args_cli.learning_rate}")
