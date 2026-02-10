@@ -104,7 +104,7 @@ class ImitatorPolicy(torch.nn.Module):
           running_mean_std.running_var → running_var
         """
         model = cls(obs_dim, action_dim, hidden_units)
-        ckpt = torch.load(path, map_location="cpu")
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
         state = ckpt["model"]
 
         new_state = {}
