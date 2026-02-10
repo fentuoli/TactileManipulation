@@ -75,6 +75,7 @@ class DexHandImitatorEnvCfg(DirectRLEnvCfg):
             friction_correlation_distance=0.0005,
             gpu_found_lost_aggregate_pairs_capacity=1024 * 1024 * 4,
             gpu_total_aggregate_pairs_capacity=16 * 1024,
+            enable_external_forces_every_iteration=True,  # Required for wrist force control
         ),
         gravity=(0.0, 0.0, -9.81),
     )

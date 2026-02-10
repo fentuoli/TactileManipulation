@@ -121,14 +121,50 @@ class ImitatorPolicy(torch.nn.Module):
                 new_state["running_var"] = v
             # Skip: sigma, value, critic, count
 
+        # Validate key matching
+        expected_keys = set(model.state_dict().keys())
+        matched_keys = set(new_state.keys()) & expected_keys
+        missing_keys = expected_keys - set(new_state.keys())
+        unexpected_keys = set(new_state.keys()) - expected_keys
+
         model.load_state_dict(new_state, strict=False)
         model.to(device)
         model.eval()
         for param in model.parameters():
             param.requires_grad = False
 
+        # Diagnostic output
         print(f"[INFO] Loaded imitator policy from {path}")
         print(f"[INFO]   obs_dim={obs_dim}, action_dim={action_dim}, units={list(hidden_units)}")
+        print(f"[INFO]   Checkpoint keys: {len(state)} total, {len(matched_keys)}/{len(expected_keys)} matched")
+        if missing_keys:
+            print(f"[WARNING]   Missing keys (using defaults): {missing_keys}")
+        if unexpected_keys:
+            print(f"[WARNING]   Unexpected keys (ignored): {unexpected_keys}")
+
+        # Weight statistics
+        total_params = sum(p.numel() for p in model.parameters())
+        print(f"[INFO]   Total parameters: {total_params:,}")
+
+        # Running mean/std diagnostics (should NOT be zeros/ones if imitator was trained)
+        rm = model.running_mean
+        rv = model.running_var
+        rm_nonzero = (rm.abs() > 1e-6).sum().item()
+        rv_nondefault = ((rv - 1.0).abs() > 1e-6).sum().item()
+        print(f"[INFO]   running_mean: {rm_nonzero}/{rm.shape[0]} non-zero "
+              f"(mean={rm.mean().item():.4f}, std={rm.std().item():.4f})")
+        print(f"[INFO]   running_var: {rv_nondefault}/{rv.shape[0]} non-default "
+              f"(mean={rv.mean().item():.4f}, std={rv.std().item():.4f})")
+        if rm_nonzero == 0 and rv_nondefault == 0:
+            print(f"[WARNING]   running_mean_std appears untrained (all zeros/ones)!")
+
+        # Test forward pass with dummy input
+        dummy = torch.zeros(1, obs_dim, device=device)
+        test_out = model(dummy)
+        out_norm = test_out.norm().item()
+        print(f"[INFO]   Test forward pass: input zeros → output norm={out_norm:.6f}, "
+              f"shape={list(test_out.shape)}")
+
         return model
 
 
@@ -163,6 +199,7 @@ class DexHandManipEnvCfg(DirectRLEnvCfg):
             friction_correlation_distance=0.0005,   # Match original ManipTrans
             gpu_found_lost_aggregate_pairs_capacity=1024 * 1024 * 4,
             gpu_total_aggregate_pairs_capacity=16 * 1024,
+            enable_external_forces_every_iteration=True,  # Required for wrist force control
         ),
         gravity=(0.0, 0.0, -9.81),
     )
@@ -385,7 +422,11 @@ class DexHandManipEnv(DirectRLEnv):
 
         # Load frozen imitator policy for residual learning
         ckpt_path = cfg.rh_base_checkpoint if cfg.side == "right" else cfg.lh_base_checkpoint
+        print(f"[INFO] Imitator checkpoint path ({cfg.side}): {ckpt_path}")
         if ckpt_path is not None and os.path.exists(ckpt_path):
+            file_size_mb = os.path.getsize(ckpt_path) / (1024 * 1024)
+            print(f"[INFO] Imitator checkpoint file size: {file_size_mb:.2f} MB")
+            print(f"[INFO] Expected imitator obs_dim={self._imitator_obs_dim}, action_dim={self._imitator_action_dim}")
             self.imitator_policy = ImitatorPolicy.from_rl_games_checkpoint(
                 path=ckpt_path,
                 obs_dim=self._imitator_obs_dim,
@@ -394,12 +435,24 @@ class DexHandManipEnv(DirectRLEnv):
                 device=str(self.device),
             )
             self._has_imitator = True
+            # Batch-size test forward pass
+            dummy_batch = torch.randn(min(4, self.num_envs), self._imitator_obs_dim, device=self.device)
+            test_actions = self.imitator_policy(dummy_batch)
+            print(f"[INFO] Imitator batch test: input({list(dummy_batch.shape)}) → "
+                  f"output({list(test_actions.shape)}), "
+                  f"action_range=[{test_actions.min().item():.3f}, {test_actions.max().item():.3f}]")
+            has_nan = torch.isnan(test_actions).any().item()
+            has_inf = torch.isinf(test_actions).any().item()
+            if has_nan or has_inf:
+                print(f"[ERROR] Imitator output contains nan={has_nan}, inf={has_inf} — loading may be incorrect!")
+            else:
+                print(f"[INFO] Imitator loaded and validated successfully.")
         else:
             self.imitator_policy = None
             self._has_imitator = False
             if ckpt_path is not None:
                 print(f"[WARNING] Imitator checkpoint not found: {ckpt_path}")
-            print("[INFO] No imitator loaded — base_action will be zeros (no residual benefit)")
+            print("[WARNING] No imitator loaded — base_action will be zeros (no residual benefit)")
 
         # Pre-allocate base action buffer
         self._base_action_buf = torch.zeros(
