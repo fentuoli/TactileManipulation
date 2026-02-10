@@ -178,6 +178,7 @@ class DexHandManipEnv(DirectRLEnv):
         # For quat: 1 (flag?) + 6 (wrist) + n_dofs (fingers) for each
         single_action_dim = (1 + 6 + n_dofs) if use_quat_rot else (6 + n_dofs)
         cfg.num_actions = single_action_dim * 2  # base + residual
+        cfg.action_space = cfg.num_actions  # Sync with num_actions for RL framework
 
         # Target observation dimension
         n_fingertips = 5  # Number of fingertips for obj_to_joints
@@ -213,6 +214,7 @@ class DexHandManipEnv(DirectRLEnv):
         extra_obs_dim = 1
 
         cfg.num_observations = prop_obs_dim + target_obs_dim + extra_obs_dim
+        cfg.observation_space = cfg.num_observations  # Sync with num_observations for RL framework
         cfg.num_states = 0  # No asymmetric states for now
 
         super().__init__(cfg, render_mode, **kwargs)
