@@ -76,6 +76,8 @@ class DexHandManipEnvCfg(DirectRLEnvCfg):
     state_space = 0
 
     # Simulation
+    # Original ManipTrans: dt=1/60, substeps=2 → effective physics dt = 1/120
+    # IsaacLab equivalent: dt=1/120, decimation=2 → policy runs at 1/60, physics at 1/120
     sim: SimulationCfg = SimulationCfg(
         dt=1 / 120,
         render_interval=2,
@@ -87,6 +89,8 @@ class DexHandManipEnvCfg(DirectRLEnvCfg):
             bounce_threshold_velocity=0.2,
             gpu_found_lost_aggregate_pairs_capacity=1024 * 1024 * 4,
             gpu_total_aggregate_pairs_capacity=16 * 1024,
+            # Matching original ManipTrans PhysX config
+            max_depenetration_velocity=1000.0,
         ),
         gravity=(0.0, 0.0, -9.81),
     )
@@ -640,6 +644,10 @@ class DexHandManipEnv(DirectRLEnv):
                     max_linear_velocity=50.0,
                     max_angular_velocity=100.0,
                 ),
+                collision_props=sim_utils.CollisionPropertiesCfg(
+                    contact_offset=0.005,   # Match original ManipTrans
+                    rest_offset=0.0,        # Match original ManipTrans
+                ),
                 articulation_props=sim_utils.ArticulationRootPropertiesCfg(
                     enabled_self_collisions=self.dexhand.self_collision,
                     solver_position_iteration_count=8,
@@ -696,8 +704,17 @@ class DexHandManipEnv(DirectRLEnv):
                     usd_path=usd_path,
                     rigid_props=sim_utils.RigidBodyPropertiesCfg(
                         disable_gravity=False,
+                        max_depenetration_velocity=1000.0,  # Match original ManipTrans
+                        max_linear_velocity=50.0,           # Match original: prevent object flying
+                        max_angular_velocity=100.0,         # Match original: prevent object spinning
                     ),
-                    collision_props=sim_utils.CollisionPropertiesCfg(),
+                    collision_props=sim_utils.CollisionPropertiesCfg(
+                        contact_offset=0.005,   # Match original ManipTrans
+                        rest_offset=0.0,        # Match original ManipTrans
+                    ),
+                    mass_props=sim_utils.MassPropertiesCfg(
+                        density=200.0,  # Match original: average density of 3D-printed models
+                    ),
                 ),
                 init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, 0.5)),
             )
@@ -710,8 +727,17 @@ class DexHandManipEnv(DirectRLEnv):
                     size=(0.05, 0.05, 0.05),
                     rigid_props=sim_utils.RigidBodyPropertiesCfg(
                         disable_gravity=False,
+                        max_depenetration_velocity=1000.0,
+                        max_linear_velocity=50.0,
+                        max_angular_velocity=100.0,
                     ),
-                    collision_props=sim_utils.CollisionPropertiesCfg(),
+                    mass_props=sim_utils.MassPropertiesCfg(
+                        density=200.0,
+                    ),
+                    collision_props=sim_utils.CollisionPropertiesCfg(
+                        contact_offset=0.005,
+                        rest_offset=0.0,
+                    ),
                 ),
                 init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, 0.5)),
             )
@@ -831,16 +857,22 @@ class DexHandManipEnv(DirectRLEnv):
             print(f"[WARNING] Could not get object mass: {e}, using 0.1 kg")
             self.manip_obj_mass[:] = 0.1
 
-        # Store original object friction for curriculum
+        # Set object friction to match original ManipTrans (2.0, not the global 4.0)
+        # Original: element.friction = 2.0 (compensates for missing skin deformation friction)
+        # The global physics_material (4.0) is for the hand; object needs different value.
         try:
             mat_props = self.object.root_physx_view.get_material_properties()  # (num_envs, num_shapes, 3)
             # mat_props[..., 0] = static_friction, [..1] = dynamic_friction, [..2] = restitution
+            # Override to match original ManipTrans object friction = 2.0
+            mat_props[:, :, 0] = 2.0  # static friction
+            mat_props[:, :, 1] = 2.0  # dynamic friction
+            self.object.root_physx_view.set_material_properties(mat_props)
+            # Now store these as "original" for friction curriculum
             self._original_obj_static_friction = mat_props[:, :, 0].clone()
             self._original_obj_dynamic_friction = mat_props[:, :, 1].clone()
-            print(f"[INFO] Original object friction: static={self._original_obj_static_friction[0, 0].item():.2f}, "
-                  f"dynamic={self._original_obj_dynamic_friction[0, 0].item():.2f}")
+            print(f"[INFO] Object friction set to match original ManipTrans: static=2.00, dynamic=2.00")
         except Exception as e:
-            print(f"[WARNING] Could not get object material properties: {e}")
+            print(f"[WARNING] Could not set object material properties: {e}")
             self._original_obj_static_friction = None
             self._original_obj_dynamic_friction = None
 
