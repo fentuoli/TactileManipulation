@@ -224,12 +224,109 @@ delta_joints_pos = (target_joints_pos - cur_joints_pos[:, None]).reshape(nE, -1)
 
 **修复**: 在 `_get_dones()` 中添加 `self.running_progress_buf += 1`。
 
+### 问题 11（严重）：四元数格式不兼容 — IsaacGym 训练的 imitator 在 IsaacLab 中无法使用
+
+**文件**: `maniptrans_envs/tasks/dexhand_manip_env.py`
+
+**原代码**: 观测中的四元数统一使用 IsaacLab 的 wxyz 格式，但预训练的 base imitator（behavioral cloning 模型）是在 IsaacGym 环境下训练的，期望 xyzw 格式输入。
+
+**后果**: 喂给 imitator 的四元数格式错误，base policy 输出完全错误的动作，残差策略无法在此基础上学习有效的修正。
+
+**修复**:
+1. 新增配置项 `use_isaacgym_imitator: bool = True`，控制观测中四元数的格式
+2. 新增辅助函数：
+   ```python
+   def wxyz_to_xyzw(quat):         # IsaacLab → IsaacGym 格式转换
+   def quat_mul_xyzw(a, b):        # xyzw 格式的四元数乘法
+   def quat_conjugate_xyzw(q):     # xyzw 格式的四元数共轭
+   ```
+3. 在 `_compute_target_observations()` 中，对手腕四元数和物体四元数的计算分别做条件转换：
+   - `use_isaacgym_imitator=True`：将 wxyz 转为 xyzw，用 `quat_mul_xyzw` 计算 delta
+   - `use_isaacgym_imitator=False`：保持 wxyz，用 IsaacLab 原生 `quat_mul` 计算 delta
+
+**注意**: 此选项仅影响**观测中**的四元数格式（喂给 imitator 的输入）。奖励函数和终止条件中的四元数计算始终使用 wxyz 格式（IsaacLab 内部一致性）。
+
+### 问题 12（严重）：缺少重力课程学习（Gravity Curriculum）
+
+**文件**: `maniptrans_envs/tasks/dexhand_manip_env.py`
+
+**原版 ManipTrans 行为**: 通过 IsaacGym 的 `apply_randomizations` 框架实现重力渐进：
+- 重力从 0 线性增加到 -9.81 m/s²，经过 1920 步完成
+- 公式：`effective_gravity = -9.81 * min(step, 1920) / 1920`
+- 手的 `disable_gravity=True`，不受重力课程影响
+- 只有物体受到重力变化的影响
+- 更新频率：每 32 个 env step 更新一次
+
+**IsaacLab 中的实现方式**: 采用**补偿力**方案（而非直接修改 PhysX 全局重力），物理上等价：
+```python
+# 向上补偿力 = 物体质量 × 9.81 × (1 - gravity_scale)
+# gravity_scale 从 0 → 1 渐变
+compensation_z = self.manip_obj_mass * 9.81 * (1.0 - self.gravity_scale)
+self.object_gravity_force[:, 0, 2] = compensation_z
+self.object.set_external_force_and_torque(forces=self.object_gravity_force, ...)
+```
+
+**为什么用补偿力而非修改 PhysX 重力**: IsaacLab 的 GPU pipeline 中直接修改全局重力的 API 不确定是否可靠（缓存问题），而补偿力方案利用已验证的 `set_external_force_and_torque()` API，效果完全等价（因为手本身 `disable_gravity=True`）。
+
+### 问题 13（严重）：缺少物体摩擦力课程学习（Friction Curriculum）
+
+**文件**: `maniptrans_envs/tasks/dexhand_manip_env.py`
+
+**原版 ManipTrans 行为**: 物体摩擦力从 3× 默认值线性衰减到 1× 默认值：
+- 公式：`friction_scale = 3 × sched_scaling + 1 × (1 - sched_scaling)`
+- `sched_scaling = 1 - min(step, 1920) / 1920`（linear_decay）
+- 训练初期高摩擦力防止物体滑落，逐步降低到真实值
+
+**后果**: 缺少摩擦力课程导致训练初期物体容易从手中滑落，增加学习难度。
+
+**修复**: 通过 PhysX tensor API 动态更新物体材质属性：
+```python
+mat_props = self.object.root_physx_view.get_material_properties()
+mat_props[:, :, 0] = original_static_friction * friction_scale   # static
+mat_props[:, :, 1] = original_dynamic_friction * friction_scale  # dynamic
+self.object.root_physx_view.set_material_properties(mat_props)
+```
+
+### 问题 14（中等）：缺少 `manip_obj_weight` 观测
+
+**文件**: `maniptrans_envs/tasks/dexhand_manip_env.py`
+
+**原版 ManipTrans**: 观测向量中包含 `manip_obj_weight = mass × |gravity.z|`（1 维），告知策略当前有效重力大小。
+
+**后果**: 策略无法感知重力课程的当前阶段，无法根据重力大小调整抓握力度。
+
+**修复**:
+```python
+manip_obj_weight = (self.manip_obj_mass * 9.81 * self.gravity_scale).unsqueeze(-1)
+obs = torch.cat([prop_obs, target_obs, manip_obj_weight], dim=-1)
+```
+同时更新 `num_observations` 计算，增加 1 维。
+
+### 新增配置项（问题 12-14 相关）
+
+```python
+# Domain Randomization / Curriculum
+enable_gravity_curriculum: bool = True   # 重力从 0 → -9.81 渐变
+gravity_curriculum_steps: int = 1920     # 达到完整重力的步数
+enable_friction_curriculum: bool = True  # 物体摩擦力从 3× → 1× 渐变
+friction_curriculum_steps: int = 1920    # 达到正常摩擦力的步数
+friction_curriculum_init_scale: float = 3.0  # 初始摩擦力倍率
+dr_frequency: int = 32                  # DR 更新频率（每 N 个 env step）
+```
+
+### 实现细节
+
+- **延迟初始化** (`_dr_initialized` flag)：PhysX views 在第一个仿真步之前不可用，因此在首次调用 `_apply_domain_randomization()` 时才读取物体质量和原始摩擦力
+- **训练/测试区分**：DR 仅在训练时生效（`self.training` 检查），测试时 `gravity_scale=1.0`、`friction_scale=1.0`
+- **物体质量上限**：`clamp(max=0.5)` 防止异常大质量导致补偿力过大
+- **set_external_force_and_torque 的叠加**：手腕力和物体重力补偿力分别通过 `self.hand.set_external_force_and_torque()` 和 `self.object.set_external_force_and_torque()` 施加，互不干扰
+
 ---
 
 ## 修改的文件
 
 1. `main/dataset/mano2dexhand.py` — 修复 isaac2chain_order 构建/使用、URDF 关节限位解析
-2. `maniptrans_envs/tasks/dexhand_manip_env.py` — 修复力施加、奖励函数、终止条件、物理参数、观测 delta、progress 计数
+2. `maniptrans_envs/tasks/dexhand_manip_env.py` — 修复力施加、奖励函数、终止条件、物理参数、观测 delta、progress 计数、四元数双格式支持、重力/摩擦力课程学习、`manip_obj_weight` 观测
 
 ## 验证方法
 
@@ -249,6 +346,10 @@ delta_joints_pos = (target_joints_pos - cur_joints_pos[:, None]).reshape(nE, -1)
    - 检查 `[INFO] Contact body indices` 包含 5 个有效索引
    - 检查奖励日志中 `reward_joints_pos`、`reward_power`、`reward_finger_tip_force` 均有非零值
    - 检查手腕在仿真中有实际运动（不是静止不动）
+   - 检查 `[INFO] Object mass:` 打印正确的物体质量
+   - 检查 `[INFO] Original object friction:` 打印正确的摩擦力值
+   - 检查训练初期重力补偿力非零（物体不会立即坠落），1920 步后归零
+   - 检查 `use_isaacgym_imitator=True` 时 imitator 行为正常（手跟踪 demo 轨迹）
 
 ## 注意事项
 
@@ -258,3 +359,8 @@ delta_joints_pos = (target_joints_pos - cur_joints_pos[:, None]).reshape(nE, -1)
 - IsaacLab 的 `set_external_force_and_torque()` 是缓冲式 API，需要 `write_data_to_sim()` 才生效，`DirectRLEnv` 会自动调用
 - 四元数在 IsaacLab 中统一使用 **wxyz** 格式（w 在 index 0），与 IsaacGym 的 xyzw 不同
 - 接触力通过 `root_physx_view.get_net_contact_forces()` 获取，如果 API 不可用会 fallback 到零值
+- IsaacGym 训练的 imitator 使用 **xyzw** 四元数格式，需要设 `use_isaacgym_imitator=True`
+- 重力课程采用补偿力方案实现，物理等价于修改全局重力（因手 `disable_gravity=True`）
+- `set_external_force_and_torque()` 是缓冲式 API，手腕力和物体补偿力分别对 `self.hand` 和 `self.object` 调用，互不覆盖
+- 摩擦力课程通过 `root_physx_view.get/set_material_properties()` tensor API 实现，每 32 步更新一次
+- DR 相关 PhysX views 在首步之前不可用，需延迟初始化（`_dr_initialized` flag）

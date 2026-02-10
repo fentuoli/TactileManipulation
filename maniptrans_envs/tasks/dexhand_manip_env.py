@@ -130,6 +130,14 @@ class DexHandManipEnvCfg(DirectRLEnvCfg):
     # Max episode length
     max_episode_length: int = 1200
 
+    # Domain Randomization / Curriculum (matching original ManipTrans ResDexHand.yaml)
+    enable_gravity_curriculum: bool = True   # Ramp gravity from 0 → -9.81
+    gravity_curriculum_steps: int = 1920     # Steps to reach full gravity
+    enable_friction_curriculum: bool = True  # Ramp object friction from 3× → 1×
+    friction_curriculum_steps: int = 1920    # Steps to reach normal friction
+    friction_curriculum_init_scale: float = 3.0  # Initial friction multiplier
+    dr_frequency: int = 32                   # How often to update DR (in env steps)
+
 
 @configclass
 class DexHandManipRHEnvCfg(DexHandManipEnvCfg):
@@ -201,7 +209,10 @@ class DexHandManipEnv(DirectRLEnv):
         # Proprioception dimension: q, cos_q, sin_q, base_state
         prop_obs_dim = n_dofs * 3 + 13  # q, cos(q), sin(q), base_state
 
-        cfg.num_observations = prop_obs_dim + target_obs_dim
+        # Extra observation: manip_obj_weight (1 dim) — tells policy current effective gravity on object
+        extra_obs_dim = 1
+
+        cfg.num_observations = prop_obs_dim + target_obs_dim + extra_obs_dim
         cfg.num_states = 0  # No asymmetric states for now
 
         super().__init__(cfg, render_mode, **kwargs)
@@ -500,6 +511,15 @@ class DexHandManipEnv(DirectRLEnv):
         self.best_rollout_len = 0
         self.best_rollout_begin = 0
 
+        # Domain randomization buffers
+        self._dr_initialized = False  # Will be initialized on first step (after physics views ready)
+        self.gravity_scale = 0.0 if (self.training and self.cfg.enable_gravity_curriculum) else 1.0
+        self.current_friction_scale = self.cfg.friction_curriculum_init_scale if (self.training and self.cfg.enable_friction_curriculum) else 1.0
+        # Object gravity compensation force buffer (num_envs, 1, 3) for RigidObject
+        self.object_gravity_force = torch.zeros(self.num_envs, 1, 3, device=self.device)
+        self.object_gravity_torque = torch.zeros(self.num_envs, 1, 3, device=self.device)
+        self.manip_obj_mass = torch.zeros(self.num_envs, device=self.device)  # filled on first step
+
     def _load_demo_data(self):
         """Load demonstration data for imitation learning."""
         # Compute transformation matrix from MuJoCo to Gym coordinate frame
@@ -784,6 +804,94 @@ class DexHandManipEnv(DirectRLEnv):
             is_global=True,      # ENV_SPACE = global/world frame
         )
 
+        # Domain randomization: gravity & friction curriculum
+        self._apply_domain_randomization()
+
+        # Apply gravity compensation force on object (implements gravity curriculum)
+        # When gravity_scale < 1, an upward force partially cancels gravity on the object
+        if self.cfg.enable_gravity_curriculum and self.training:
+            self.object.set_external_force_and_torque(
+                forces=self.object_gravity_force,
+                torques=self.object_gravity_torque,
+                body_ids=None,
+                env_ids=None,
+                is_global=True,
+            )
+
+    def _init_domain_randomization(self):
+        """Initialize DR state from physics views (called once after first sim step)."""
+        # Get object mass from PhysX
+        try:
+            masses = self.object.root_physx_view.get_masses()  # (num_envs, 1)
+            self.manip_obj_mass = masses.squeeze(-1).clamp(max=0.5)  # cap at 500g like original
+            print(f"[INFO] Object mass: {self.manip_obj_mass[0].item():.4f} kg (capped at 0.5)")
+        except Exception as e:
+            print(f"[WARNING] Could not get object mass: {e}, using 0.1 kg")
+            self.manip_obj_mass[:] = 0.1
+
+        # Store original object friction for curriculum
+        try:
+            mat_props = self.object.root_physx_view.get_material_properties()  # (num_envs, num_shapes, 3)
+            # mat_props[..., 0] = static_friction, [..1] = dynamic_friction, [..2] = restitution
+            self._original_obj_static_friction = mat_props[:, :, 0].clone()
+            self._original_obj_dynamic_friction = mat_props[:, :, 1].clone()
+            print(f"[INFO] Original object friction: static={self._original_obj_static_friction[0, 0].item():.2f}, "
+                  f"dynamic={self._original_obj_dynamic_friction[0, 0].item():.2f}")
+        except Exception as e:
+            print(f"[WARNING] Could not get object material properties: {e}")
+            self._original_obj_static_friction = None
+            self._original_obj_dynamic_friction = None
+
+        self._dr_initialized = True
+
+    def _apply_domain_randomization(self):
+        """Apply gravity curriculum and friction curriculum (matching original ManipTrans DR).
+
+        Gravity curriculum: effective gravity ramps from 0 → -9.81 over gravity_curriculum_steps.
+        Implemented via compensating upward force on object (hand has disable_gravity=True).
+
+        Friction curriculum: object friction starts at init_scale× and decays to 1× over friction_curriculum_steps.
+        """
+        if not self.training:
+            return
+
+        if not self._dr_initialized:
+            self._init_domain_randomization()
+
+        step = self.global_step_count
+
+        # Only update at DR frequency (matching original frequency: 32)
+        if step % self.cfg.dr_frequency != 0 and step > 0:
+            return
+
+        # --- Gravity curriculum ---
+        if self.cfg.enable_gravity_curriculum:
+            # gravity_scale: 0 → 1 over gravity_curriculum_steps
+            # Matches original: scaling operation + linear_decay schedule + const_scale init_value=0
+            self.gravity_scale = min(step, self.cfg.gravity_curriculum_steps) / max(self.cfg.gravity_curriculum_steps, 1)
+            # Compensating upward force: neutralizes (1 - gravity_scale) fraction of gravity
+            # When gravity_scale=0: full compensation (object floats), gravity_scale=1: no compensation
+            compensation_z = self.manip_obj_mass * 9.81 * (1.0 - self.gravity_scale)
+            self.object_gravity_force[:, 0, 2] = compensation_z
+
+        # --- Friction curriculum ---
+        if self.cfg.enable_friction_curriculum and self._original_obj_static_friction is not None:
+            # friction_scale: init_scale → 1 over friction_curriculum_steps
+            # Matches original: scaling + linear_decay + const_scale init_value=3
+            # sample = init_value * sched_scaling + 1 * (1 - sched_scaling)
+            # sched_scaling = 1 - min(step, N) / N  (linear_decay)
+            sched_scaling = 1.0 - min(step, self.cfg.friction_curriculum_steps) / max(self.cfg.friction_curriculum_steps, 1)
+            friction_scale = self.cfg.friction_curriculum_init_scale * sched_scaling + 1.0 * (1.0 - sched_scaling)
+            self.current_friction_scale = friction_scale
+
+            try:
+                mat_props = self.object.root_physx_view.get_material_properties()
+                mat_props[:, :, 0] = self._original_obj_static_friction * friction_scale
+                mat_props[:, :, 1] = self._original_obj_dynamic_friction * friction_scale
+                self.object.root_physx_view.set_material_properties(mat_props)
+            except Exception:
+                pass  # Silently skip if API not available
+
     def _apply_pid_control(self, base_action, residual_action, root_control_dim):
         """Apply PID-based wrist control."""
         position_error = base_action[:, 0:3]
@@ -855,8 +963,12 @@ class DexHandManipEnv(DirectRLEnv):
         # Target observations (from demo data)
         target_obs = self._compute_target_observations()
 
+        # Extra observations: effective object weight (mass * |gravity| * gravity_scale)
+        # Matches original ManipTrans "manip_obj_weight" privileged obs
+        manip_obj_weight = (self.manip_obj_mass * 9.81 * self.gravity_scale).unsqueeze(-1)
+
         # Combine observations
-        obs = torch.cat([prop_obs, target_obs], dim=-1)
+        obs = torch.cat([prop_obs, target_obs, manip_obj_weight], dim=-1)
 
         # Check for NaN values
         if torch.isnan(obs).any():
