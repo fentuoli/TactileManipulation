@@ -364,3 +364,242 @@ dr_frequency: int = 32                  # DR 更新频率（每 N 个 env step�
 - `set_external_force_and_torque()` 是缓冲式 API，手腕力和物体补偿力分别对 `self.hand` 和 `self.object` 调用，互不覆盖
 - 摩擦力课程通过 `root_physx_view.get/set_material_properties()` tensor API 实现，每 32 步更新一次
 - DR 相关 PhysX views 在首步之前不可用，需延迟初始化（`_dr_initialized` flag）
+
+---
+
+## 第二轮逐行对比发现的问题（问题 15-26）
+
+以下问题通过逐行对比 IsaacLab 迁移代码与原版 ManipTrans（IsaacGym）代码发现，涉及 `dexhand_manip_env.py` 和 `dexhand_imitator_env.py` 两个文件。
+
+### 问题 15（严重）：ROBOT_HEIGHT 值错误
+
+**文件**: `dexhand_manip_env.py`, `dexhand_imitator_env.py`
+
+**原代码**: `ROBOT_HEIGHT = 0.15`
+
+**正确值**: `ROBOT_HEIGHT = 0.00214874`（来自原版 `main/cfg/config.py`）
+
+**后果**: 手腕高度偏差约 148mm，导致手在桌面上方过高位置初始化，与 demo 轨迹不匹配。所有依赖手腕高度的计算（wrist_pos 观测、reset 位置等）均受影响。
+
+**修复**: 两个文件均改为 `ROBOT_HEIGHT = 0.00214874`。
+
+### 问题 16（中等）：桌子 X 方向偏移缺失
+
+**文件**: `dexhand_manip_env.py`, `dexhand_imitator_env.py`
+
+**原代码**: `translation=(0.0, 0.0, 0.4)`
+
+**正确值**: `translation=(-0.1, 0.0, 0.4)`（原版 `table_width_offset / 2 = -0.1`）
+
+**后果**: 桌子中心相对于手的位置偏移了 10cm，影响物体放置位置和手-桌交互。
+
+**修复**: 两个文件均改为 `translation=(-0.1, 0.0, 0.4)`。
+
+### 问题 17（中等）：桌面摩擦力错误
+
+**文件**: `dexhand_manip_env.py`, `dexhand_imitator_env.py`
+
+**原代码**: 桌子使用全局 `physics_material`（摩擦力 4.0，与手相同）
+
+**正确值**: 原版桌面摩擦力为 **0.1**，远低于手的 4.0
+
+**后果**: 桌面摩擦力过高（40 倍）会导致物体在桌面上难以滑动，影响推/拉操作的物理行为。
+
+**修复**: 在 CuboidCfg 中设置独立的 `physics_material`:
+```python
+spawn=sim_utils.CuboidCfg(
+    ...
+    physics_material=sim_utils.RigidBodyMaterialCfg(
+        static_friction=0.1,
+        dynamic_friction=0.1,
+        restitution=0.0,
+    ),
+)
+```
+
+### 问题 18（致命）：`_apply_action` 被调用 `decimation` 次导致双重移动平均
+
+**文件**: `dexhand_manip_env.py`, `dexhand_imitator_env.py`
+
+**原代码**: 在 `_apply_action()` 中计算 DOF targets、moving average、wrist force/torque。
+
+**原版行为**: 原版 ManipTrans 的 `pre_physics_step()` 每个策略步仅调用一次，在其中完成所有计算。
+
+**IsaacLab 差异**: IsaacLab 的 `_apply_action()` 每个策略步被调用 `decimation` 次（默认 2 次），而 `_pre_physics_step()` 仅被调用 1 次。
+
+**后果**:
+- Moving average 被应用 2 次：`target = α*action + (1-α)*prev`，第二次又混合一次，导致动作过度平滑
+- 手腕力 PD 控制器被执行 2 次，目标位置被更新 2 次
+- 关节目标也被设置 2 次
+
+**修复**: 将所有计算逻辑从 `_apply_action()` 移到 `_pre_physics_step()`（仅执行 1 次），`_apply_action()` 只负责将预计算的值写入仿真：
+```python
+def _pre_physics_step(self, actions):
+    self.actions = actions.clone().clamp(-1.0, 1.0)
+    # 所有计算：moving average, DOF target scaling, force/torque computation
+    ...
+
+def _apply_action(self):
+    # 仅写入仿真
+    self.hand.set_joint_position_target(self.curr_targets)
+    self.hand.set_external_force_and_torque(...)
+```
+
+### 问题 19（严重）：力缩放使用错误的时间步长
+
+**文件**: `dexhand_manip_env.py`, `dexhand_imitator_env.py`
+
+**原代码**: 力/力矩计算中使用 `self.physics_dt`（= 1/120）
+
+**正确值**: 应使用 `self.step_dt`（= physics_dt × decimation = 1/60），对应原版的 `self.dt`
+
+**原版代码**:
+```python
+# 原版 ManipTrans (IsaacGym)
+force = (self.kp * p_error + self.kd * d_error) / self.dt  # self.dt = 1/60
+```
+
+**后果**: 使用 1/120 而非 1/60，力被缩放了 2 倍，导致手腕力控制过强，可能引起手腕振荡或不稳定。
+
+**修复**: 两个文件均改为 `self.step_dt`：
+```python
+force = (Kp * pos_error + Kd * vel_error) / self.step_dt
+```
+
+### 问题 20（中等）：DOF 速度在 reset 时未夹紧到 URDF 限位
+
+**文件**: `dexhand_manip_env.py`, `dexhand_imitator_env.py`
+
+**原代码**: reset 时直接从 demo 加载 DOF 速度，不做限位检查。
+
+**原版行为**: reset 时会将 DOF 速度夹紧到 URDF 中定义的 `velocity` 限位。
+
+**后果**: 如果 demo 数据中某些关节速度超过 URDF 定义的物理限位，PhysX 可能产生异常行为。
+
+**修复**:
+1. 在 `_init_buffers()` 中从 URDF 解析每个关节的 `velocity` 限位并存储为 `dof_speed_limits`
+2. 在 `_reset_idx()` 中夹紧：
+```python
+speed_limits_demo = self.dof_speed_limits[self.demo_to_isaaclab_dof_mapping]
+dof_vel = torch.clamp(dof_vel_demo, -speed_limits_demo, speed_limits_demo)
+```
+
+### 问题 21（中等）：reset 后 PD 控制器初始目标不匹配
+
+**文件**: `dexhand_manip_env.py`, `dexhand_imitator_env.py`
+
+**原代码**: reset 时设置 `dof_pos` 但未设置对应的位置目标（position target）。
+
+**后果**: PD 控制器在 reset 后的第一帧使用旧的目标位置（或默认 0），与新的 dof_pos 不匹配，产生瞬间大力矩导致手抖动。
+
+**修复**: reset 时同步设置位置目标：
+```python
+self.hand.write_joint_state_to_sim(dof_pos, dof_vel, env_ids=env_ids)
+self.hand.set_joint_position_target(dof_pos, env_ids=env_ids)  # 新增
+```
+
+### 问题 22（严重）：本体感觉观测中 base 位置未清零
+
+**文件**: `dexhand_manip_env.py`（仅残差环境）
+
+**原代码**: 直接使用 `hand_root_state[:, :13]` 作为 base_state（包含 xyz 位置）。
+
+**原版行为**: base_state 的前 3 个分量（位置 xyz）被清零：
+```python
+base_state = self.base_state.clone()
+base_state[:, :3] = 0  # 清零位置
+```
+
+**原因**: 手腕绝对位置信息已通过 target 观测中的 `delta_wrist_pos` 隐式提供（相对当前位置的目标差值），保留绝对位置会引入与环境坐标系相关的偏差。
+
+**修复**:
+```python
+zeroed_root_state = self.hand_root_state[:, :13].clone()
+zeroed_root_state[:, :3] = 0  # 清零位置，保留姿态/速度
+```
+
+### 问题 23（严重）：特权观测 (privileged obs) 内容不完整
+
+**文件**: `dexhand_manip_env.py`（仅残差环境）
+
+**原代码**: 特权观测仅包含 `hand_dof_vel`（n_dofs 维）。
+
+**原版 ManipTrans 特权观测**（对应 `spaces.Dict` 中的 `privileged` key）:
+
+| 分量 | 维度 | 说明 |
+|------|------|------|
+| `dq`（DOF 速度） | n_dofs | 关节角速度 |
+| `obj_pos_rel` | 3 | 物体相对手腕位置 |
+| `obj_quat` | 4 | 物体四元数 |
+| `obj_vel` | 3 | 物体线速度 |
+| `obj_ang_vel` | 3 | 物体角速度 |
+| `tip_force_3d` | n_tips×3 | 指尖 3D 接触力 |
+| `tip_force_mag` | n_tips×1 | 指尖力大小 |
+| `obj_com_rel` | 3 | 物体质心相对手腕位置 |
+| `obj_weight` | 1 | 物体重量（mass × gravity_scale × 9.81） |
+
+**以 Inspire 手为例**: n_dofs=12, n_tips=5 → 特权观测维度 = 12+3+4+3+3+15+5+3+1 = **49**
+
+**后果**: 缺失物体状态和接触力信息使得残差策略无法感知：
+- 物体当前位姿和速度
+- 指尖是否接触物体
+- 当前有效重力大小
+
+**修复**: 补全所有特权观测分量，并更新 `num_observations` 计算。
+
+### 问题 24（严重）：`obj_to_joints` 距离计算使用错误的 body 集合
+
+**文件**: `dexhand_manip_env.py`（仅残差环境）
+
+**原代码**: 使用 5 个指尖位置 `self.fingertip_pos` 计算物体到关节的距离。
+
+**原版行为**: 使用**所有** body 位置（n_bodies 个，Inspire=18）计算物体到每个 body 的距离。
+
+**后果**:
+- 目标观测中的 `obj_to_joints` 维度错误：5×3=15 vs 应为 18×3=54
+- 只关注指尖而忽略手掌和近端关节，丢失了物体与手掌接触的重要信息
+
+**修复**: 使用所有 body 位置：
+```python
+all_hand_body_pos = self.hand_body_pos_all[:, self.demo_body_to_isaaclab_indices]
+obj_to_joints = (manip_obj_pos.unsqueeze(1) - all_hand_body_pos)
+```
+
+### 问题 25（中等）：`obs_future_length` 默认值错误
+
+**文件**: `dexhand_manip_env.py`（仅残差环境）
+
+**原代码**: `obs_future_length: int = 3`
+
+**正确值**: `obs_future_length: int = 1`（原版默认值）
+
+**后果**: 3 帧未来观测使得目标观测维度膨胀 3 倍，增加网络输入维度和计算量，且与原版训练配置不一致。
+
+### 问题 26（中等）：`tighten_method` 默认值错误
+
+**文件**: `dexhand_manip_env.py`（仅残差环境）
+
+**原代码**: `tighten_method: str = "None"`
+
+**正确值**: `tighten_method: str = "exp_decay"`（原版默认值）
+
+**后果**: 课程学习未启用，训练初期终止阈值不会逐步收紧。原版使用指数衰减：
+```python
+scale = (e**2)**(-step/tighten_steps) * (1 - tighten_factor) + tighten_factor
+```
+scale 从 1.0 衰减到 `tighten_factor`（0.7），逐步提高跟踪精度要求。
+
+---
+
+## 第二轮修改的文件
+
+1. `maniptrans_envs/tasks/dexhand_manip_env.py` — 修复 ROBOT_HEIGHT、桌子偏移/摩擦力、_pre_physics_step/_apply_action 拆分、力缩放 step_dt、DOF 速度夹紧、reset 位置目标、base 位置清零、特权观测补全、obj_to_joints 全 body、obs_future_length、tighten_method
+2. `maniptrans_envs/tasks/dexhand_imitator_env.py` — 修复 ROBOT_HEIGHT、桌子偏移/摩擦力、_pre_physics_step/_apply_action 拆分、力缩放 step_dt、DOF 速度夹紧、reset 位置目标
+
+## 第二轮验证方法
+
+1. **观测维度检查**: 启动时会打印 `[INFO] Manip obs dims: prop=X, priv=X, target=X, total=X`，对照原版检查各部分维度
+2. **力缩放检查**: 确认 `step_dt` 打印值为 ~0.01667（1/60），而非 0.00833（1/120）
+3. **Reset 检查**: 确认 reset 后第一帧手不会抖动（PD 目标与 dof_pos 匹配）
+4. **桌面交互**: 确认物体在桌面上可以正常滑动（摩擦力 0.1 而非 4.0）
+5. **课程学习**: 确认 tighten_method="exp_decay" 时 scale_factor 随步数递减

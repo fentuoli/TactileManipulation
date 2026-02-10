@@ -44,8 +44,8 @@ from main.dataset.factory import ManipDataFactory
 from main.dataset.transform import aa_to_quat, aa_to_rotmat, rotmat_to_quat, rotmat_to_aa, rot6d_to_aa
 
 
-# Configuration constants
-ROBOT_HEIGHT = 0.15
+# Configuration constants (must match original ManipTrans)
+ROBOT_HEIGHT = 0.00214874
 
 
 @configclass
@@ -331,9 +331,26 @@ class DexHandImitatorEnv(DirectRLEnv):
         self.dexhand_dof_lower_limits = torch.tensor(lower_limits, device=self.device, dtype=torch.float32)
         self.dexhand_dof_upper_limits = torch.tensor(upper_limits, device=self.device, dtype=torch.float32)
 
+        # Read DOF speed limits from URDF (velocity attribute)
+        speed_limits = []
+        for jname in actual_joint_names:
+            found = False
+            for joint_elem in urdf_root.findall('.//joint'):
+                if joint_elem.get('name') == jname:
+                    limit_elem = joint_elem.find('limit')
+                    if limit_elem is not None:
+                        vel = float(limit_elem.get('velocity', '100.0'))
+                        speed_limits.append(vel)
+                        found = True
+                    break
+            if not found:
+                speed_limits.append(100.0)
+        self.dexhand_dof_speed_limits = torch.tensor(speed_limits, device=self.device, dtype=torch.float32)
+
         print(f"[INFO] Joint limits (IsaacLab order):")
         print(f"[INFO]   Lower: {self.dexhand_dof_lower_limits.tolist()}")
         print(f"[INFO]   Upper: {self.dexhand_dof_upper_limits.tolist()}")
+        print(f"[INFO]   Speed: {self.dexhand_dof_speed_limits.tolist()}")
 
         # Also build limits in demo order for noisy reset clamping
         self.dexhand_dof_lower_limits_demo = self.dexhand_dof_lower_limits[self.demo_to_isaaclab_dof_mapping]
@@ -521,14 +538,18 @@ class DexHandImitatorEnv(DirectRLEnv):
 
         self.hand = Articulation(self.robot_cfg)
 
-        # Create table
+        # Create table with friction=0.1 (matching original ManipTrans, not global 4.0)
         table_cfg = sim_utils.CuboidCfg(
             size=(1.0, 1.6, 0.03),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
             collision_props=sim_utils.CollisionPropertiesCfg(),
+            physics_material=RigidBodyMaterialCfg(
+                static_friction=0.1,
+                dynamic_friction=0.1,
+            ),
             visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.1, 0.1, 0.1)),
         )
-        table_cfg.func("/World/envs/env_.*/Table", table_cfg, translation=(0.0, 0.0, 0.4))
+        table_cfg.func("/World/envs/env_.*/Table", table_cfg, translation=(-0.1, 0.0, 0.4))
 
         # NO object spawned (imitator = hand only)
 
@@ -542,11 +563,14 @@ class DexHandImitatorEnv(DirectRLEnv):
         light_cfg.func("/World/Light", light_cfg)
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
-        """Process actions before physics step."""
+        """Process actions before physics step.
+
+        Computes DOF targets and wrist forces/torques once per policy step,
+        matching original ManipTrans where pre_physics_step runs once with dt=1/60.
+        _apply_action() then just writes these pre-computed values to the sim.
+        """
         self.actions = actions.clone()
 
-    def _apply_action(self) -> None:
-        """Apply single-policy actions (no base+residual split)."""
         root_control_dim = 9 if self.use_pid_control else 6
 
         # DOF position targets from action (in demo order)
@@ -565,7 +589,7 @@ class DexHandImitatorEnv(DirectRLEnv):
             self.dexhand_dof_upper_limits,
         )
 
-        # Apply moving average
+        # Apply moving average (once per policy step, matching original)
         self.curr_targets = (
             self.act_moving_average * self.curr_targets
             + (1.0 - self.act_moving_average) * self.prev_targets
@@ -578,14 +602,22 @@ class DexHandImitatorEnv(DirectRLEnv):
             self.dexhand_dof_upper_limits,
         )
 
-        # Apply wrist forces/torques (single policy, no residual)
+        self.prev_targets[:] = self.curr_targets[:]
+
+        # Compute wrist forces/torques (single policy, no residual)
+        # Use step_dt (= physics_dt * decimation = 1/60) to match original dt=1/60
         if self.use_pid_control:
             self._apply_pid_control()
         else:
             self._apply_force_control()
 
+    def _apply_action(self) -> None:
+        """Write pre-computed targets and forces to the simulator.
+
+        Called decimation times (2x) per policy step. All computation is done
+        in _pre_physics_step to match original once-per-step behavior.
+        """
         # Set joint position targets
-        self.prev_targets[:] = self.curr_targets[:]
         self.hand.set_joint_position_target(self.curr_targets)
 
         # Apply external forces/torques to wrist
@@ -599,10 +631,12 @@ class DexHandImitatorEnv(DirectRLEnv):
 
     def _apply_pid_control(self):
         """Apply PID-based wrist control (single policy)."""
+        # Use step_dt (= physics_dt * decimation = 1/60) to match original dt=1/60
+        dt = self.step_dt
         position_error = self.actions[:, :3]
-        self.pos_error_integral += position_error * self.physics_dt
+        self.pos_error_integral += position_error * dt
         self.pos_error_integral = torch.clamp(self.pos_error_integral, -1, 1)
-        pos_derivative = (position_error - self.prev_pos_error) / self.physics_dt
+        pos_derivative = (position_error - self.prev_pos_error) / dt
         force = (
             self.Kp_pos * position_error
             + self.Ki_pos * self.pos_error_integral
@@ -612,9 +646,9 @@ class DexHandImitatorEnv(DirectRLEnv):
 
         rotation_error = self.actions[:, 3:9]
         rotation_error = rot6d_to_aa(rotation_error)
-        self.rot_error_integral += rotation_error * self.physics_dt
+        self.rot_error_integral += rotation_error * dt
         self.rot_error_integral = torch.clamp(self.rot_error_integral, -1, 1)
-        rot_derivative = (rotation_error - self.prev_rot_error) / self.physics_dt
+        rot_derivative = (rotation_error - self.prev_rot_error) / dt
         torque = (
             self.Kp_rot * rotation_error
             + self.Ki_rot * self.rot_error_integral
@@ -633,8 +667,10 @@ class DexHandImitatorEnv(DirectRLEnv):
 
     def _apply_force_control(self):
         """Apply direct force control to wrist (single policy)."""
-        force = self.actions[:, 0:3] * self.physics_dt * self.translation_scale * 500
-        torque = self.actions[:, 3:6] * self.physics_dt * self.orientation_scale * 200
+        # Use step_dt (= physics_dt * decimation = 1/60) to match original dt=1/60
+        dt = self.step_dt
+        force = self.actions[:, 0:3] * dt * self.translation_scale * 500
+        torque = self.actions[:, 3:6] * dt * self.orientation_scale * 200
 
         self.apply_forces[:, self.wrist_body_idx, :] = (
             self.act_moving_average * force
@@ -1059,8 +1095,15 @@ class DexHandImitatorEnv(DirectRLEnv):
             self.dexhand_dof_upper_limits_demo.unsqueeze(0),
         )
 
-        # Small random DOF velocities (in demo order)
+        # Small random DOF velocities (in demo order), clamped to speed limits
         dof_vel_demo = torch.randn(n_envs_reset, self.dexhand.n_dofs, device=self.device) * 0.1
+        # Speed limits in demo order for clamping
+        speed_limits_demo = self.dexhand_dof_speed_limits[self.demo_to_isaaclab_dof_mapping]
+        dof_vel_demo = torch.clamp(
+            dof_vel_demo,
+            -speed_limits_demo.unsqueeze(0),
+            speed_limits_demo.unsqueeze(0),
+        )
 
         # Reorder from demo order to IsaacLab order
         indices = self.demo_to_isaaclab_dof_mapping.unsqueeze(0).expand(n_envs_reset, -1)
@@ -1072,6 +1115,9 @@ class DexHandImitatorEnv(DirectRLEnv):
         dof_pos = saturate(dof_pos, self.dexhand_dof_lower_limits, self.dexhand_dof_upper_limits)
 
         self.hand.write_joint_state_to_sim(dof_pos, dof_vel, env_ids=env_ids)
+
+        # Set initial position targets to match DOF state (prevents PD controller fighting)
+        self.hand.set_joint_position_target(dof_pos, env_ids=env_ids)
 
         # --- Reset wrist state from demo data + noise ---
         wrist_pos = self.demo_data["wrist_pos"][env_ids_tensor, seq_idx]

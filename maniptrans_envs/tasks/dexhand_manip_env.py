@@ -57,8 +57,8 @@ def quat_conjugate_xyzw(q: torch.Tensor) -> torch.Tensor:
     return torch.cat([-q[..., :3], q[..., 3:4]], dim=-1)
 
 
-# Configuration constants
-ROBOT_HEIGHT = 0.15
+# Configuration constants (must match original ManipTrans)
+ROBOT_HEIGHT = 0.00214874
 
 
 @configclass
@@ -118,12 +118,12 @@ class DexHandManipEnvCfg(DirectRLEnvCfg):
 
     # Training settings
     training: bool = True
-    obs_future_length: int = 3
+    obs_future_length: int = 1  # Match original ManipTrans (obsFutureLength: 1)
     rollout_state_init: bool = False
     random_state_init: bool = True
 
     # Tightening curriculum
-    tighten_method: str = "None"  # "None", "const", "linear_decay", "exp_decay", "cos"
+    tighten_method: str = "exp_decay"  # Match original ManipTrans (tightenMethod: "exp_decay")
     tighten_factor: float = 0.7
     tighten_steps: int = 3200
 
@@ -185,11 +185,12 @@ class DexHandManipEnv(DirectRLEnv):
         cfg.action_space = cfg.num_actions  # Sync with num_actions for RL framework
 
         # Target observation dimension
-        n_fingertips = 5  # Number of fingertips for obj_to_joints
+        n_contact_bodies = len(self.dexhand.contact_body_names)  # 5 for most hands
+        n_all_bodies = self.dexhand.n_bodies  # All bodies including wrist (for obj_to_joints)
         n_joint_bodies = self.dexhand.n_bodies - 1  # Bodies excluding wrist for joint tracking
         target_obs_dim = (
             128  # BPS features
-            + n_fingertips  # obj_to_joints (NOT multiplied by obs_future_length)
+            + n_all_bodies  # obj_to_joints: distance from obj to ALL bodies (not just fingertips)
             + (
                 3   # delta_wrist_pos
                 + 3   # wrist_vel
@@ -206,20 +207,31 @@ class DexHandManipEnv(DirectRLEnv):
                 + 4   # delta_manip_obj_quat
                 + 3   # manip_obj_ang_vel
                 + 3   # delta_manip_obj_ang_vel
-                + n_fingertips  # gt_tips_distance (per frame)
+                + n_contact_bodies  # gt_tips_distance (per frame)
             )
             * cfg.obs_future_length
         )
 
-        # Proprioception dimension: q, cos_q, sin_q, base_state
+        # Proprioception dimension: q, cos_q, sin_q, base_state (pos zeroed)
         prop_obs_dim = n_dofs * 3 + 13  # q, cos(q), sin(q), base_state
 
-        # Extra observation: manip_obj_weight (1 dim) — tells policy current effective gravity on object
-        extra_obs_dim = 1
+        # Privileged observations (matching original ManipTrans Dict obs "privileged" key)
+        # dq(n_dofs) + manip_obj_pos_rel(3) + manip_obj_quat(4) + manip_obj_vel(3)
+        # + manip_obj_ang_vel(3) + tip_force_with_mag(n_contact*4) + manip_obj_com_rel(3) + manip_obj_weight(1)
+        priv_obs_dim = n_dofs + 3 + 4 + 3 + 3 + n_contact_bodies * 4 + 3 + 1
 
-        cfg.num_observations = prop_obs_dim + target_obs_dim + extra_obs_dim
+        cfg.num_observations = prop_obs_dim + priv_obs_dim + target_obs_dim
         cfg.observation_space = cfg.num_observations  # Sync with num_observations for RL framework
         cfg.num_states = 0  # No asymmetric states for now
+
+        self._priv_obs_dim = priv_obs_dim
+
+        root_ctrl_desc = "1+6" if use_quat_rot else "6"
+        print(f"[INFO] Manip obs dims: prop={prop_obs_dim}, priv={priv_obs_dim}, "
+              f"target={target_obs_dim} (bps=128, obj2joints={n_all_bodies}, "
+              f"per_frame*{cfg.obs_future_length}), total={cfg.num_observations}")
+        print(f"[INFO] Manip action dim: {cfg.num_actions} (base+residual, "
+              f"each {single_action_dim}: root({root_ctrl_desc})+{n_dofs}dofs)")
 
         super().__init__(cfg, render_mode, **kwargs)
 
@@ -462,9 +474,26 @@ class DexHandManipEnv(DirectRLEnv):
         self.dexhand_dof_lower_limits = torch.tensor(lower_limits, device=self.device, dtype=torch.float32)
         self.dexhand_dof_upper_limits = torch.tensor(upper_limits, device=self.device, dtype=torch.float32)
 
+        # Read DOF speed limits from URDF (velocity attribute)
+        speed_limits = []
+        for jname in actual_joint_names:
+            found = False
+            for joint_elem in urdf_root.findall('.//joint'):
+                if joint_elem.get('name') == jname:
+                    limit_elem = joint_elem.find('limit')
+                    if limit_elem is not None:
+                        vel = float(limit_elem.get('velocity', '100.0'))
+                        speed_limits.append(vel)
+                        found = True
+                    break
+            if not found:
+                speed_limits.append(100.0)
+        self.dexhand_dof_speed_limits = torch.tensor(speed_limits, device=self.device, dtype=torch.float32)
+
         print(f"[INFO] Joint limits (IsaacLab order):")
         print(f"[INFO]   Lower: {self.dexhand_dof_lower_limits.tolist()}")
         print(f"[INFO]   Upper: {self.dexhand_dof_upper_limits.tolist()}")
+        print(f"[INFO]   Speed: {self.dexhand_dof_speed_limits.tolist()}")
 
         # Action-related buffers
         self.prev_targets = torch.zeros(
@@ -525,6 +554,7 @@ class DexHandManipEnv(DirectRLEnv):
         self.object_gravity_force = torch.zeros(self.num_envs, 1, 3, device=self.device)
         self.object_gravity_torque = torch.zeros(self.num_envs, 1, 3, device=self.device)
         self.manip_obj_mass = torch.zeros(self.num_envs, device=self.device)  # filled on first step
+        self.manip_obj_com = torch.zeros(self.num_envs, 3, device=self.device)  # object center of mass offset
 
     def _load_demo_data(self):
         """Load demonstration data for imitation learning."""
@@ -672,14 +702,18 @@ class DexHandManipEnv(DirectRLEnv):
         # Create the robot articulation
         self.hand = Articulation(self.robot_cfg)
 
-        # Create table
+        # Create table with friction=0.1 (matching original ManipTrans, not global 4.0)
         table_cfg = sim_utils.CuboidCfg(
             size=(1.0, 1.6, 0.03),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
             collision_props=sim_utils.CollisionPropertiesCfg(),
+            physics_material=RigidBodyMaterialCfg(
+                static_friction=0.1,
+                dynamic_friction=0.1,
+            ),
             visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.1, 0.1, 0.1)),
         )
-        table_cfg.func("/World/envs/env_.*/Table", table_cfg, translation=(0.0, 0.0, 0.4))
+        table_cfg.func("/World/envs/env_.*/Table", table_cfg, translation=(-0.1, 0.0, 0.4))
 
         # Spawn object from URDF if available
         # Note: Single-link URDFs without joints cannot be loaded as Articulations
@@ -763,11 +797,14 @@ class DexHandManipEnv(DirectRLEnv):
         # Note: Joint limits will be initialized in _init_buffers() after physics views are available
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
-        """Process actions before physics step."""
+        """Process actions before physics step.
+
+        Computes DOF targets and wrist forces/torques once per policy step,
+        matching original ManipTrans where pre_physics_step runs once with dt=1/60.
+        _apply_action() then just writes these pre-computed values to the sim.
+        """
         self.actions = actions.clone()
 
-    def _apply_action(self) -> None:
-        """Apply actions to the robot."""
         root_control_dim = 9 if self.use_pid_control else 6
         res_split_idx = (
             self.actions.shape[1] // 2
@@ -786,7 +823,6 @@ class DexHandManipEnv(DirectRLEnv):
         dof_pos_demo_order = torch.clamp(dof_pos_demo_order, -1, 1)
 
         # Reorder from demo order to IsaacLab order using scatter
-        # demo_to_isaaclab_dof_mapping[demo_idx] = isaaclab_idx
         indices = self.demo_to_isaaclab_dof_mapping.unsqueeze(0).expand(dof_pos_demo_order.shape[0], -1)
         dof_pos = torch.zeros_like(dof_pos_demo_order)
         dof_pos.scatter_(1, indices, dof_pos_demo_order)
@@ -798,7 +834,7 @@ class DexHandManipEnv(DirectRLEnv):
             self.dexhand_dof_upper_limits,
         )
 
-        # Apply moving average
+        # Apply moving average (once per policy step, matching original)
         self.curr_targets = (
             self.act_moving_average * self.curr_targets
             + (1.0 - self.act_moving_average) * self.prev_targets
@@ -811,32 +847,37 @@ class DexHandManipEnv(DirectRLEnv):
             self.dexhand_dof_upper_limits,
         )
 
-        # Apply wrist forces/torques
+        self.prev_targets[:] = self.curr_targets[:]
+
+        # Compute wrist forces/torques (once per policy step)
+        # Use step_dt (= physics_dt * decimation = 1/60) to match original dt=1/60
         if self.use_pid_control:
             self._apply_pid_control(base_action, residual_action, root_control_dim)
         else:
             self._apply_force_control(base_action, residual_action)
 
+        # Domain randomization: gravity & friction curriculum (once per policy step)
+        self._apply_domain_randomization()
+
+    def _apply_action(self) -> None:
+        """Write pre-computed targets and forces to the simulator.
+
+        Called decimation times (2x) per policy step. All computation is done
+        in _pre_physics_step to match original once-per-step behavior.
+        """
         # Set joint position targets
-        self.prev_targets[:] = self.curr_targets[:]
         self.hand.set_joint_position_target(self.curr_targets)
 
-        # Apply external forces/torques to wrist via IsaacLab API
-        # Equivalent to IsaacGym's gym.apply_rigid_body_force_tensors(..., gymapi.ENV_SPACE)
-        # set_external_force_and_torque buffers the wrench; scene.write_data_to_sim() applies it
+        # Apply external forces/torques to wrist
         self.hand.set_external_force_and_torque(
             forces=self.apply_forces,
             torques=self.apply_torques,
-            body_ids=None,       # all bodies (only wrist_body_idx has non-zero values)
-            env_ids=None,        # all environments
-            is_global=True,      # ENV_SPACE = global/world frame
+            body_ids=None,
+            env_ids=None,
+            is_global=True,
         )
 
-        # Domain randomization: gravity & friction curriculum
-        self._apply_domain_randomization()
-
         # Apply gravity compensation force on object (implements gravity curriculum)
-        # When gravity_scale < 1, an upward force partially cancels gravity on the object
         if self.cfg.enable_gravity_curriculum and self.training:
             self.object.set_external_force_and_torque(
                 forces=self.object_gravity_force,
@@ -856,6 +897,15 @@ class DexHandManipEnv(DirectRLEnv):
         except Exception as e:
             print(f"[WARNING] Could not get object mass: {e}, using 0.1 kg")
             self.manip_obj_mass[:] = 0.1
+
+        # Get object center of mass
+        try:
+            coms = self.object.root_physx_view.get_coms()  # (num_envs, 1, 7) - pos(3) + quat(4)
+            self.manip_obj_com = coms[:, 0, :3].to(self.device)
+            print(f"[INFO] Object COM offset: {self.manip_obj_com[0].tolist()}")
+        except Exception as e:
+            print(f"[WARNING] Could not get object COM: {e}, using zeros")
+            self.manip_obj_com[:] = 0.0
 
         # Set object friction to match original ManipTrans (2.0, not the global 4.0)
         # Original: element.friction = 2.0 (compensates for missing skin deformation friction)
@@ -928,30 +978,32 @@ class DexHandManipEnv(DirectRLEnv):
 
     def _apply_pid_control(self, base_action, residual_action, root_control_dim):
         """Apply PID-based wrist control."""
+        # Use step_dt (= physics_dt * decimation = 1/60) to match original dt=1/60
+        dt = self.step_dt
         position_error = base_action[:, 0:3]
-        self.pos_error_integral += position_error * self.physics_dt
+        self.pos_error_integral += position_error * dt
         self.pos_error_integral = torch.clamp(self.pos_error_integral, -1, 1)
-        pos_derivative = (position_error - self.prev_pos_error) / self.physics_dt
+        pos_derivative = (position_error - self.prev_pos_error) / dt
         force = (
             self.Kp_pos * position_error
             + self.Ki_pos * self.pos_error_integral
             + self.Kd_pos * pos_derivative
         )
         self.prev_pos_error = position_error
-        force = force + residual_action[:, 0:3] * self.physics_dt * self.translation_scale * 500
+        force = force + residual_action[:, 0:3] * dt * self.translation_scale * 500
 
         rotation_error = base_action[:, 3:root_control_dim]
         rotation_error = rot6d_to_aa(rotation_error)
-        self.rot_error_integral += rotation_error * self.physics_dt
+        self.rot_error_integral += rotation_error * dt
         self.rot_error_integral = torch.clamp(self.rot_error_integral, -1, 1)
-        rot_derivative = (rotation_error - self.prev_rot_error) / self.physics_dt
+        rot_derivative = (rotation_error - self.prev_rot_error) / dt
         torque = (
             self.Kp_rot * rotation_error
             + self.Ki_rot * self.rot_error_integral
             + self.Kd_rot * rot_derivative
         )
         self.prev_rot_error = rotation_error
-        torque = torque + residual_action[:, 3:6] * self.physics_dt * self.orientation_scale * 200
+        torque = torque + residual_action[:, 3:6] * dt * self.orientation_scale * 200
 
         self.apply_forces[:, self.wrist_body_idx, :] = (
             self.act_moving_average * force
@@ -964,13 +1016,15 @@ class DexHandManipEnv(DirectRLEnv):
 
     def _apply_force_control(self, base_action, residual_action):
         """Apply direct force control to wrist."""
+        # Use step_dt (= physics_dt * decimation = 1/60) to match original dt=1/60
+        dt = self.step_dt
         force = (
-            1.0 * (base_action[:, 0:3] * self.physics_dt * self.translation_scale * 500)
-            + (residual_action[:, 0:3] * self.physics_dt * self.translation_scale * 500)
+            1.0 * (base_action[:, 0:3] * dt * self.translation_scale * 500)
+            + (residual_action[:, 0:3] * dt * self.translation_scale * 500)
         )
         torque = (
-            1.0 * (base_action[:, 3:6] * self.physics_dt * self.orientation_scale * 200)
-            + (residual_action[:, 3:6] * self.physics_dt * self.orientation_scale * 200)
+            1.0 * (base_action[:, 3:6] * dt * self.orientation_scale * 200)
+            + (residual_action[:, 3:6] * dt * self.orientation_scale * 200)
         )
 
         self.apply_forces[:, self.wrist_body_idx, :] = (
@@ -986,23 +1040,57 @@ class DexHandManipEnv(DirectRLEnv):
         """Compute and return observations."""
         self._compute_intermediate_values()
 
-        # Proprioception observations
+        # Proprioception observations (zero out base position, matching original)
+        zeroed_root_state = torch.cat([
+            torch.zeros_like(self.hand_root_state[:, :3]),  # Zero out position
+            self.hand_root_state[:, 3:],  # Keep quat + vel + ang_vel
+        ], dim=-1)
         prop_obs = torch.cat([
             self.hand_dof_pos,
             torch.cos(self.hand_dof_pos),
             torch.sin(self.hand_dof_pos),
-            self.hand_root_state,
+            zeroed_root_state,
+        ], dim=-1)
+
+        # Privileged observations (matching original ManipTrans Dict obs "privileged" key)
+        # manip_obj_pos relative to hand base position
+        manip_obj_pos_rel = self.object_pos - self.hand_root_state[:, :3]
+        # manip_obj_quat
+        manip_obj_quat = self.object_rot
+        # manip_obj_com relative to hand base (world-frame COM)
+        try:
+            cur_com_pos = (
+                quat_to_rotmat(self.object_rot)
+                @ self.manip_obj_com.unsqueeze(-1)
+            ).squeeze(-1) + self.object_pos
+            manip_obj_com_rel = cur_com_pos - self.hand_root_state[:, :3]
+        except Exception:
+            manip_obj_com_rel = manip_obj_pos_rel  # fallback if COM not available
+        # tip_force with magnitude (n_contact_bodies * 4)
+        tip_force = self.net_contact_forces[:, self.contact_body_indices, :]  # (nE, 5, 3)
+        tip_force_with_mag = torch.cat([
+            tip_force,
+            torch.norm(tip_force, dim=-1, keepdim=True),
+        ], dim=-1).reshape(self.num_envs, -1)  # (nE, 5*4=20)
+        # manip_obj_weight
+        manip_obj_weight = (self.manip_obj_mass * 9.81 * self.gravity_scale).unsqueeze(-1)
+
+        priv_obs = torch.cat([
+            self.hand_dof_vel,                   # dq (n_dofs)
+            manip_obj_pos_rel,                   # obj pos relative to hand (3)
+            manip_obj_quat,                      # obj quat (4)
+            self.object_linvel,                  # obj linear vel (3)
+            self.object_angvel,                  # obj angular vel (3)
+            tip_force_with_mag,                  # fingertip contact forces (5*4=20)
+            manip_obj_com_rel,                   # obj COM relative to hand (3)
+            manip_obj_weight,                    # effective obj weight (1)
         ], dim=-1)
 
         # Target observations (from demo data)
         target_obs = self._compute_target_observations()
 
-        # Extra observations: effective object weight (mass * |gravity| * gravity_scale)
-        # Matches original ManipTrans "manip_obj_weight" privileged obs
-        manip_obj_weight = (self.manip_obj_mass * 9.81 * self.gravity_scale).unsqueeze(-1)
-
-        # Combine observations
-        obs = torch.cat([prop_obs, target_obs, manip_obj_weight], dim=-1)
+        # Combine observations: prop + priv + target (matching original Dict obs layout)
+        obs = torch.cat([prop_obs, priv_obs, target_obs], dim=-1)
 
         # Check for NaN values
         if torch.isnan(obs).any():
@@ -1054,6 +1142,13 @@ class DexHandManipEnv(DirectRLEnv):
         # All body positions in demo order (excluding wrist) for reward computation
         all_body_pos_isaaclab = self.hand.data.body_pos_w - self.scene.env_origins.unsqueeze(1)
         self.hand_body_pos = all_body_pos_isaaclab[:, self.demo_body_to_isaaclab_indices]  # (nE, n_bodies-1, 3)
+
+        # All body positions in demo order (INCLUDING wrist) for obj_to_joints
+        # Original uses joints_state which includes ALL body positions (n_bodies)
+        all_body_demo_indices = [self.body_name_to_idx[name] for name in self.dexhand.body_names
+                                 if name in self.body_name_to_idx]
+        all_body_demo_indices = torch.tensor(all_body_demo_indices, device=self.device, dtype=torch.long)
+        self.all_hand_body_pos = all_body_pos_isaaclab[:, all_body_demo_indices]  # (nE, n_bodies, 3)
 
         # Body velocities: try body_vel_w (6D) first, fallback to body_link_vel_w
         try:
@@ -1180,9 +1275,9 @@ class DexHandManipEnv(DirectRLEnv):
         manip_obj_ang_vel = target_obj_ang_vel.reshape(nE, -1)
         delta_manip_obj_ang_vel = (target_obj_ang_vel - self.object_angvel[:, None]).reshape(nE, -1)
 
-        # Object to joints distance
+        # Object to joints distance (ALL bodies, not just fingertips, matching original)
         obj_to_joints = torch.norm(
-            self.object_pos[:, None] - self.fingertip_pos, dim=-1
+            self.object_pos[:, None] - self.all_hand_body_pos, dim=-1
         ).reshape(nE, -1)
 
         # Tips distance from demo
@@ -1584,7 +1679,17 @@ class DexHandManipEnv(DirectRLEnv):
 
         dof_pos = saturate(dof_pos, self.dexhand_dof_lower_limits, self.dexhand_dof_upper_limits)
 
+        # Clamp DOF velocities to speed limits (matching original ManipTrans)
+        dof_vel = torch.clamp(
+            dof_vel,
+            -self.dexhand_dof_speed_limits.unsqueeze(0),
+            self.dexhand_dof_speed_limits.unsqueeze(0),
+        )
+
         self.hand.write_joint_state_to_sim(dof_pos, dof_vel, env_ids=env_ids)
+
+        # Set initial position targets to match DOF state (prevents PD controller fighting)
+        self.hand.set_joint_position_target(dof_pos, env_ids=env_ids)
 
         # Reset wrist pose
         opt_wrist_pos = self.demo_data["opt_wrist_pos"][env_ids_tensor, seq_idx]
