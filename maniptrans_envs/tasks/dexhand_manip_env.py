@@ -1044,14 +1044,21 @@ class DexHandManipEnv(DirectRLEnv):
 
         Returns flat tensor matching the imitator env's observation structure:
           [prop_obs(3*n_dofs+13), priv_obs(n_dofs), target_obs(23+(n_bodies-1)*9)]
-        Uses wxyz quaternions (IsaacLab native, matching IsaacLab-trained imitator).
+        Quaternion format depends on use_isaacgym_imitator:
+          True (default): xyzw (matching IsaacGym-trained imitator checkpoint)
+          False: wxyz (matching IsaacLab-trained imitator checkpoint)
         """
         nE = self.num_envs
 
         # --- Proprioception (same as manip env) ---
+        # base_state: [pos(3), quat(4), linvel(3), angvel(3)] = 13
+        root_quat = self.hand_root_state[:, 3:7]  # wxyz from IsaacLab
+        if self.cfg.use_isaacgym_imitator:
+            root_quat = wxyz_to_xyzw(root_quat)  # convert to xyzw for IsaacGym imitator
         zeroed_root_state = torch.cat([
             torch.zeros_like(self.hand_root_state[:, :3]),
-            self.hand_root_state[:, 3:],
+            root_quat,
+            self.hand_root_state[:, 7:],  # linvel + angvel (no quat conversion needed)
         ], dim=-1)
         prop_obs = torch.cat([
             self.hand_dof_pos,
@@ -1090,12 +1097,20 @@ class DexHandManipEnv(DirectRLEnv):
         delta_wrist_vel = (target_wrist_vel - cur_wrist_vel[:, None]).reshape(nE, -1)
 
         target_wrist_rot = indicing(self.demo_data["wrist_rot"], cur_idx_2d)
-        cur_wrist_rot_wxyz = self.hand_root_state[:, 3:7]
+        cur_wrist_rot_wxyz = self.hand_root_state[:, 3:7]  # wxyz from IsaacLab
         wrist_quat_wxyz = aa_to_quat(target_wrist_rot.reshape(nE, -1))  # wxyz
-        wrist_quat = wrist_quat_wxyz
-        delta_wrist_quat = quat_mul(
-            cur_wrist_rot_wxyz, quat_conjugate(wrist_quat)
-        ).reshape(nE, -1)
+        if self.cfg.use_isaacgym_imitator:
+            # Convert to xyzw for IsaacGym-trained imitator
+            cur_wrist_rot = wxyz_to_xyzw(cur_wrist_rot_wxyz)
+            wrist_quat = wxyz_to_xyzw(wrist_quat_wxyz)
+            delta_wrist_quat = quat_mul_xyzw(
+                cur_wrist_rot, quat_conjugate_xyzw(wrist_quat)
+            ).reshape(nE, -1)
+        else:
+            wrist_quat = wrist_quat_wxyz
+            delta_wrist_quat = quat_mul(
+                cur_wrist_rot_wxyz, quat_conjugate(wrist_quat)
+            ).reshape(nE, -1)
         wrist_quat = wrist_quat.reshape(nE, -1)
 
         target_wrist_ang_vel = indicing(self.demo_data["wrist_angular_velocity"], cur_idx_2d)
