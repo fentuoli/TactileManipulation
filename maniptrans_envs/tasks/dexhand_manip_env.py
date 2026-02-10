@@ -61,6 +61,77 @@ def quat_conjugate_xyzw(q: torch.Tensor) -> torch.Tensor:
 ROBOT_HEIGHT = 0.00214874
 
 
+class ImitatorPolicy(torch.nn.Module):
+    """Lightweight inference-only wrapper for loading frozen imitator RL Games checkpoints.
+
+    Reconstructs just the actor MLP + input normalization from an RL Games
+    continuous_a2c_logstd checkpoint. No critic, no sigma — only deterministic
+    mu output for base action computation.
+    """
+
+    def __init__(self, obs_dim: int, action_dim: int, hidden_units=(512, 256, 128)):
+        super().__init__()
+        # Running mean/std for input normalization (matches RL Games running_mean_std)
+        self.running_mean = torch.nn.Parameter(torch.zeros(obs_dim), requires_grad=False)
+        self.running_var = torch.nn.Parameter(torch.ones(obs_dim), requires_grad=False)
+
+        # Actor MLP (matches RL Games a2c_network.actor_mlp)
+        layers = []
+        in_dim = obs_dim
+        for h in hidden_units:
+            layers.extend([torch.nn.Linear(in_dim, h), torch.nn.ELU()])
+            in_dim = h
+        self.actor_mlp = torch.nn.Sequential(*layers)
+        self.mu = torch.nn.Linear(in_dim, action_dim)
+
+    @torch.no_grad()
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        """Deterministic forward pass: normalize → MLP → mu."""
+        obs = (obs - self.running_mean) / torch.sqrt(self.running_var + 1e-5)
+        obs = torch.clamp(obs, -5.0, 5.0)
+        x = self.actor_mlp(obs)
+        return self.mu(x)
+
+    @classmethod
+    def from_rl_games_checkpoint(cls, path: str, obs_dim: int, action_dim: int,
+                                  hidden_units=(512, 256, 128), device="cuda"):
+        """Load from an RL Games checkpoint file.
+
+        Maps RL Games state dict keys to our simplified model:
+          a2c_network.actor_mlp.{i}.weight/bias → actor_mlp.{i}.weight/bias
+          a2c_network.mu.weight/bias → mu.weight/bias
+          running_mean_std.running_mean → running_mean
+          running_mean_std.running_var → running_var
+        """
+        model = cls(obs_dim, action_dim, hidden_units)
+        ckpt = torch.load(path, map_location="cpu")
+        state = ckpt["model"]
+
+        new_state = {}
+        for k, v in state.items():
+            if k.startswith("a2c_network.actor_mlp."):
+                new_key = k.replace("a2c_network.", "")
+                new_state[new_key] = v
+            elif k.startswith("a2c_network.mu."):
+                new_key = k.replace("a2c_network.", "")
+                new_state[new_key] = v
+            elif k == "running_mean_std.running_mean":
+                new_state["running_mean"] = v
+            elif k == "running_mean_std.running_var":
+                new_state["running_var"] = v
+            # Skip: sigma, value, critic, count
+
+        model.load_state_dict(new_state, strict=False)
+        model.to(device)
+        model.eval()
+        for param in model.parameters():
+            param.requires_grad = False
+
+        print(f"[INFO] Loaded imitator policy from {path}")
+        print(f"[INFO]   obs_dim={obs_dim}, action_dim={action_dim}, units={list(hidden_units)}")
+        return model
+
+
 @configclass
 class DexHandManipEnvCfg(DirectRLEnvCfg):
     """Configuration for the DexHand manipulation environment."""
@@ -71,7 +142,8 @@ class DexHandManipEnvCfg(DirectRLEnvCfg):
 
     # Action/Observation space (default values for Inspire hand with 12 DOFs)
     # Will be recalculated in __init__ based on actual hand configuration
-    action_space = 36  # (6 wrist + 12 dofs) * 2 (base + residual) for inspire
+    # PPO outputs residual actions only; base actions come from frozen imitator
+    action_space = 18  # 6 wrist + 12 dofs (residual only) for inspire
     observation_space = 794  # Computed dynamically in __init__ based on dexhand configuration
     state_space = 0
 
@@ -108,13 +180,20 @@ class DexHandManipEnvCfg(DirectRLEnvCfg):
     data_indices: List[str] | None = None  # Will use default ["g0"] if None
 
     # Action/Observation settings
-    use_quat_rot: bool = True
+    use_quat_rot: bool = False  # Original ManipTrans default: false
     action_scale: float = 1.0
     act_moving_average: float = 0.4
     translation_scale: float = 1.0
     orientation_scale: float = 0.1
     use_pid_control: bool = False
     use_isaacgym_imitator: bool = True  # True: obs quaternions in xyzw (IsaacGym); False: wxyz (IsaacLab)
+
+    # Frozen imitator checkpoints (for residual learning)
+    # When provided, the env loads a frozen imitator to produce base actions.
+    # PPO then only outputs the residual correction (action_dim = single hand action).
+    # When None, base_action = 0 and PPO learns from scratch (effectively no residual).
+    rh_base_checkpoint: str | None = None  # Right hand imitator checkpoint
+    lh_base_checkpoint: str | None = None  # Left hand imitator checkpoint
 
     # Training settings
     training: bool = True
@@ -177,12 +256,22 @@ class DexHandManipEnv(DirectRLEnv):
         # Calculate action and observation space dimensions
         n_dofs = self.dexhand.n_dofs
         use_quat_rot = cfg.use_quat_rot
-        # Action space: base + residual, each has (wrist control + finger DOFs)
-        # For non-quat: 6 (wrist force/torque) + n_dofs (fingers) for each
-        # For quat: 1 (flag?) + 6 (wrist) + n_dofs (fingers) for each
-        single_action_dim = (1 + 6 + n_dofs) if use_quat_rot else (6 + n_dofs)
-        cfg.num_actions = single_action_dim * 2  # base + residual
-        cfg.action_space = cfg.num_actions  # Sync with num_actions for RL framework
+        # Action space: PPO outputs residual action only.
+        # Base action comes from frozen imitator (always force control: 6 + n_dofs).
+        # Residual action dims depend on control mode:
+        #   Force control (default): 6 (wrist force/torque) + n_dofs
+        #   PID control: 9 (pos_error(3) + rot6d(6)) + n_dofs
+        #   Quat rot (deprecated): 1 + 6 + n_dofs
+        if cfg.use_pid_control:
+            residual_root_dims = 9  # pos_error(3) + rot6d(6)
+        elif use_quat_rot:
+            residual_root_dims = 1 + 6  # deprecated
+        else:
+            residual_root_dims = 6  # force(3) + torque(3)
+        residual_action_dim = residual_root_dims + n_dofs
+        self._residual_root_dims = residual_root_dims
+        cfg.num_actions = residual_action_dim  # Residual only (not doubled)
+        cfg.action_space = cfg.num_actions
 
         # Target observation dimension
         n_contact_bodies = len(self.dexhand.contact_body_names)  # 5 for most hands
@@ -226,12 +315,25 @@ class DexHandManipEnv(DirectRLEnv):
 
         self._priv_obs_dim = priv_obs_dim
 
-        root_ctrl_desc = "1+6" if use_quat_rot else "6"
+        # Compute imitator observation dimension (for loading frozen imitator)
+        n_joint_bodies_imit = self.dexhand.n_bodies - 1
+        imit_target_per_frame = (
+            3 + 3 + 3 + 4 + 4 + 3 + 3  # wrist: delta_pos, vel, delta_vel, quat, delta_quat, ang_vel, delta_ang_vel
+            + n_joint_bodies_imit * 3    # delta_joints_pos
+            + n_joint_bodies_imit * 3    # joints_vel
+            + n_joint_bodies_imit * 3    # delta_joints_vel
+        )
+        self._imitator_obs_dim = (n_dofs * 3 + 13) + n_dofs + imit_target_per_frame  # prop + priv + target (future=1)
+        self._imitator_action_dim = 6 + n_dofs  # imitator always uses force control: 6 wrist + n_dofs
+
         print(f"[INFO] Manip obs dims: prop={prop_obs_dim}, priv={priv_obs_dim}, "
               f"target={target_obs_dim} (bps=128, obj2joints={n_all_bodies}, "
               f"per_frame*{cfg.obs_future_length}), total={cfg.num_observations}")
-        print(f"[INFO] Manip action dim: {cfg.num_actions} (base+residual, "
-              f"each {single_action_dim}: root({root_ctrl_desc})+{n_dofs}dofs)")
+        print(f"[INFO] Manip action dim: {cfg.num_actions} (residual only, "
+              f"root({residual_root_dims})+{n_dofs}dofs)")
+        ckpt_side = cfg.rh_base_checkpoint if cfg.side == "right" else cfg.lh_base_checkpoint
+        print(f"[INFO] Imitator checkpoint: {ckpt_side or 'None (base_action=0, no residual benefit)'}")
+        print(f"[INFO] Imitator obs_dim={self._imitator_obs_dim}, action_dim={self._imitator_action_dim}")
 
         super().__init__(cfg, render_mode, **kwargs)
 
@@ -280,6 +382,29 @@ class DexHandManipEnv(DirectRLEnv):
             default_pose[8] = 0.3
             default_pose[9] = 0.01
         self.dexhand_default_dof_pos = default_pose
+
+        # Load frozen imitator policy for residual learning
+        ckpt_path = cfg.rh_base_checkpoint if cfg.side == "right" else cfg.lh_base_checkpoint
+        if ckpt_path is not None and os.path.exists(ckpt_path):
+            self.imitator_policy = ImitatorPolicy.from_rl_games_checkpoint(
+                path=ckpt_path,
+                obs_dim=self._imitator_obs_dim,
+                action_dim=self._imitator_action_dim,
+                hidden_units=(512, 256, 128),
+                device=str(self.device),
+            )
+            self._has_imitator = True
+        else:
+            self.imitator_policy = None
+            self._has_imitator = False
+            if ckpt_path is not None:
+                print(f"[WARNING] Imitator checkpoint not found: {ckpt_path}")
+            print("[INFO] No imitator loaded — base_action will be zeros (no residual benefit)")
+
+        # Pre-allocate base action buffer
+        self._base_action_buf = torch.zeros(
+            self.num_envs, self._imitator_action_dim, device=self.device
+        )
 
     def _preload_object_info(self):
         """Pre-load object URDF path before scene setup.
@@ -796,29 +921,129 @@ class DexHandManipEnv(DirectRLEnv):
 
         # Note: Joint limits will be initialized in _init_buffers() after physics views are available
 
+    def _compute_imitator_obs(self) -> torch.Tensor:
+        """Compute observations in imitator format (for frozen base policy).
+
+        Returns flat tensor matching the imitator env's observation structure:
+          [prop_obs(3*n_dofs+13), priv_obs(n_dofs), target_obs(23+(n_bodies-1)*9)]
+        Uses wxyz quaternions (IsaacLab native, matching IsaacLab-trained imitator).
+        """
+        nE = self.num_envs
+
+        # --- Proprioception (same as manip env) ---
+        zeroed_root_state = torch.cat([
+            torch.zeros_like(self.hand_root_state[:, :3]),
+            self.hand_root_state[:, 3:],
+        ], dim=-1)
+        prop_obs = torch.cat([
+            self.hand_dof_pos,
+            torch.cos(self.hand_dof_pos),
+            torch.sin(self.hand_dof_pos),
+            zeroed_root_state,
+        ], dim=-1)
+
+        # --- Privileged (joint velocities only, no object data) ---
+        priv_obs = self.hand_dof_vel
+
+        # --- Target observations (hand only, future_length=1) ---
+        cur_idx = self.episode_length_buf + 1
+        cur_idx = torch.clamp(cur_idx, torch.zeros_like(self.demo_data["seq_len"]),
+                              self.demo_data["seq_len"] - 1)
+        # future_length=1: just single frame
+        cur_idx_2d = cur_idx.unsqueeze(-1)  # (nE, 1)
+        cur_idx_2d = torch.clamp(cur_idx_2d, max=self.demo_data["seq_len"].unsqueeze(-1) - 1)
+
+        def indicing(data, idx):
+            remaining_shape = data.shape[2:]
+            expanded_idx = idx
+            for _ in remaining_shape:
+                expanded_idx = expanded_idx.unsqueeze(-1)
+            expanded_idx = expanded_idx.expand(-1, -1, *remaining_shape)
+            return torch.gather(data, 1, expanded_idx)
+
+        # Wrist target
+        target_wrist_pos = indicing(self.demo_data["wrist_pos"], cur_idx_2d)
+        cur_wrist_pos = self.hand_root_state[:, :3]
+        delta_wrist_pos = (target_wrist_pos - cur_wrist_pos[:, None]).reshape(nE, -1)
+
+        target_wrist_vel = indicing(self.demo_data["wrist_velocity"], cur_idx_2d)
+        cur_wrist_vel = self.hand_root_state[:, 7:10]
+        wrist_vel = target_wrist_vel.reshape(nE, -1)
+        delta_wrist_vel = (target_wrist_vel - cur_wrist_vel[:, None]).reshape(nE, -1)
+
+        target_wrist_rot = indicing(self.demo_data["wrist_rot"], cur_idx_2d)
+        cur_wrist_rot_wxyz = self.hand_root_state[:, 3:7]
+        wrist_quat_wxyz = aa_to_quat(target_wrist_rot.reshape(nE, -1))  # wxyz
+        wrist_quat = wrist_quat_wxyz
+        delta_wrist_quat = quat_mul(
+            cur_wrist_rot_wxyz, quat_conjugate(wrist_quat)
+        ).reshape(nE, -1)
+        wrist_quat = wrist_quat.reshape(nE, -1)
+
+        target_wrist_ang_vel = indicing(self.demo_data["wrist_angular_velocity"], cur_idx_2d)
+        cur_wrist_ang_vel = self.hand_root_state[:, 10:13]
+        wrist_ang_vel = target_wrist_ang_vel.reshape(nE, -1)
+        delta_wrist_ang_vel = (target_wrist_ang_vel - cur_wrist_ang_vel[:, None]).reshape(nE, -1)
+
+        # Joint targets (excluding wrist)
+        target_joints_pos = indicing(self.demo_data["mano_joints"], cur_idx_2d).reshape(nE, 1, -1, 3)
+        cur_joints_pos = self.hand_body_pos  # (nE, n_bodies-1, 3)
+        delta_joints_pos = (target_joints_pos - cur_joints_pos[:, None]).reshape(nE, -1)
+
+        target_joints_vel = indicing(self.demo_data["mano_joints_velocity"], cur_idx_2d).reshape(nE, 1, -1, 3)
+        cur_joints_vel = self.hand_body_vel
+        joints_vel = target_joints_vel.reshape(nE, -1)
+        delta_joints_vel = (target_joints_vel - cur_joints_vel[:, None]).reshape(nE, -1)
+
+        target_obs = torch.cat([
+            delta_wrist_pos, wrist_vel, delta_wrist_vel,
+            wrist_quat, delta_wrist_quat,
+            wrist_ang_vel, delta_wrist_ang_vel,
+            delta_joints_pos, joints_vel, delta_joints_vel,
+        ], dim=-1)
+
+        return torch.cat([prop_obs, priv_obs, target_obs], dim=-1)
+
+    @torch.no_grad()
+    def _get_base_action(self) -> torch.Tensor:
+        """Get base action from frozen imitator policy.
+
+        Returns tensor of shape (num_envs, imitator_action_dim).
+        If no imitator is loaded, returns zeros.
+        """
+        if self._has_imitator:
+            imit_obs = self._compute_imitator_obs()
+            imit_obs = torch.nan_to_num(imit_obs, nan=0.0)
+            self._base_action_buf = self.imitator_policy(imit_obs)
+        else:
+            self._base_action_buf.zero_()
+        return self._base_action_buf
+
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         """Process actions before physics step.
 
         Computes DOF targets and wrist forces/torques once per policy step,
         matching original ManipTrans where pre_physics_step runs once with dt=1/60.
         _apply_action() then just writes these pre-computed values to the sim.
+
+        Actions from PPO are the residual correction only. Base actions come from
+        the frozen imitator policy. Combined: total_action = base + residual.
         """
         self.actions = actions.clone()
 
-        root_control_dim = 9 if self.use_pid_control else 6
-        res_split_idx = (
-            self.actions.shape[1] // 2
-            if not self.use_pid_control
-            else ((self.actions.shape[1] - (root_control_dim - 6)) // 2 + (root_control_dim - 6))
-        )
+        # Get base action from frozen imitator (or zeros if no imitator)
+        # Base imitator always uses force control: [force(3), torque(3), dof(n_dofs)]
+        base_action = self._get_base_action()
+        # PPO output is the residual, scaled by 2 (matching original residual scaling)
+        residual_action = self.actions * 2
 
-        base_action = self.actions[:, :res_split_idx]
-        residual_action = self.actions[:, res_split_idx:] * 2
-
-        # DOF position targets (in demo/policy order)
+        # DOF position targets (in demo/policy order): base + residual
+        # Base DOFs always start at index 6 (after force+torque)
+        # Residual DOFs start at _residual_root_dims (6 for force, 9 for PID)
+        res_root = self._residual_root_dims
         dof_pos_demo_order = (
-            1.0 * base_action[:, root_control_dim:root_control_dim + self.dexhand.n_dofs]
-            + residual_action[:, 6:6 + self.dexhand.n_dofs]
+            1.0 * base_action[:, 6:6 + self.dexhand.n_dofs]
+            + residual_action[:, res_root:res_root + self.dexhand.n_dofs]
         )
         dof_pos_demo_order = torch.clamp(dof_pos_demo_order, -1, 1)
 
@@ -852,7 +1077,7 @@ class DexHandManipEnv(DirectRLEnv):
         # Compute wrist forces/torques (once per policy step)
         # Use step_dt (= physics_dt * decimation = 1/60) to match original dt=1/60
         if self.use_pid_control:
-            self._apply_pid_control(base_action, residual_action, root_control_dim)
+            self._apply_pid_control(base_action, residual_action)
         else:
             self._apply_force_control(base_action, residual_action)
 
@@ -900,8 +1125,8 @@ class DexHandManipEnv(DirectRLEnv):
 
         # Get object center of mass
         try:
-            coms = self.object.root_physx_view.get_coms()  # (num_envs, 1, 7) - pos(3) + quat(4)
-            self.manip_obj_com = coms[:, 0, :3].to(self.device)
+            coms = self.object.root_physx_view.get_coms().to(self.device)  # (num_envs, 7) or (num_envs, 3)
+            self.manip_obj_com = coms[:, :3]  # take only xyz position
             print(f"[INFO] Object COM offset: {self.manip_obj_com[0].tolist()}")
         except Exception as e:
             print(f"[WARNING] Could not get object COM: {e}, using zeros")
@@ -916,7 +1141,8 @@ class DexHandManipEnv(DirectRLEnv):
             # Override to match original ManipTrans object friction = 2.0
             mat_props[:, :, 0] = 2.0  # static friction
             mat_props[:, :, 1] = 2.0  # dynamic friction
-            self.object.root_physx_view.set_material_properties(mat_props)
+            env_indices = torch.arange(self.num_envs, device="cpu")
+            self.object.root_physx_view.set_material_properties(mat_props, env_indices)
             # Now store these as "original" for friction curriculum
             self._original_obj_static_friction = mat_props[:, :, 0].clone()
             self._original_obj_dynamic_friction = mat_props[:, :, 1].clone()
@@ -972,38 +1198,48 @@ class DexHandManipEnv(DirectRLEnv):
                 mat_props = self.object.root_physx_view.get_material_properties()
                 mat_props[:, :, 0] = self._original_obj_static_friction * friction_scale
                 mat_props[:, :, 1] = self._original_obj_dynamic_friction * friction_scale
-                self.object.root_physx_view.set_material_properties(mat_props)
+                env_indices = torch.arange(self.num_envs, device="cpu")
+                self.object.root_physx_view.set_material_properties(mat_props, env_indices)
             except Exception:
                 pass  # Silently skip if API not available
 
-    def _apply_pid_control(self, base_action, residual_action, root_control_dim):
-        """Apply PID-based wrist control."""
-        # Use step_dt (= physics_dt * decimation = 1/60) to match original dt=1/60
+    def _apply_pid_control(self, base_action, residual_action):
+        """Apply PID-based wrist control.
+
+        Base imitator provides force-control actions: [force(3), torque(3), ...]
+        Residual PPO provides PID actions: [pos_error(3), rot6d(6), ...]
+        Combined: final_force = base_force + PID(residual_pos_error)
+        """
         dt = self.step_dt
-        position_error = base_action[:, 0:3]
+
+        # Residual PID: position error → PID → force correction
+        position_error = residual_action[:, 0:3]
         self.pos_error_integral += position_error * dt
         self.pos_error_integral = torch.clamp(self.pos_error_integral, -1, 1)
         pos_derivative = (position_error - self.prev_pos_error) / dt
-        force = (
+        pid_force = (
             self.Kp_pos * position_error
             + self.Ki_pos * self.pos_error_integral
             + self.Kd_pos * pos_derivative
         )
         self.prev_pos_error = position_error
-        force = force + residual_action[:, 0:3] * dt * self.translation_scale * 500
+        # Add base imitator force
+        force = base_action[:, 0:3] * dt * self.translation_scale * 500 + pid_force
 
-        rotation_error = base_action[:, 3:root_control_dim]
+        # Residual PID: rotation error → PID → torque correction
+        rotation_error = residual_action[:, 3:9]
         rotation_error = rot6d_to_aa(rotation_error)
         self.rot_error_integral += rotation_error * dt
         self.rot_error_integral = torch.clamp(self.rot_error_integral, -1, 1)
         rot_derivative = (rotation_error - self.prev_rot_error) / dt
-        torque = (
+        pid_torque = (
             self.Kp_rot * rotation_error
             + self.Ki_rot * self.rot_error_integral
             + self.Kd_rot * rot_derivative
         )
         self.prev_rot_error = rotation_error
-        torque = torque + residual_action[:, 3:6] * dt * self.orientation_scale * 200
+        # Add base imitator torque
+        torque = base_action[:, 3:6] * dt * self.orientation_scale * 200 + pid_torque
 
         self.apply_forces[:, self.wrist_body_idx, :] = (
             self.act_moving_average * force

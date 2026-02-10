@@ -174,6 +174,13 @@ def main():
     env_cfg.use_pid_control = args_cli.use_pid_control
     env_cfg.training = not args_cli.test
 
+    # Pass imitator checkpoints to residual env (ignored for imitator mode)
+    if args_cli.mode == "residual":
+        if args_cli.rh_base_checkpoint:
+            env_cfg.rh_base_checkpoint = args_cli.rh_base_checkpoint
+        if args_cli.lh_base_checkpoint:
+            env_cfg.lh_base_checkpoint = args_cli.lh_base_checkpoint
+
     # Load agent config
     agent_cfg = load_agent_cfg(args_cli)
 
@@ -245,6 +252,9 @@ def main():
     print(f"  Actions moving average: {args_cli.actions_moving_average}")
     print(f"  Random state init: {args_cli.random_state_init}")
     print(f"  Test mode: {args_cli.test}")
+    if args_cli.mode == "residual":
+        print(f"  RH imitator checkpoint: {args_cli.rh_base_checkpoint or 'None'}")
+        print(f"  LH imitator checkpoint: {args_cli.lh_base_checkpoint or 'None'}")
 
     # Read configurations about the agent-training
     rl_device = agent_cfg["params"]["config"]["device"]
