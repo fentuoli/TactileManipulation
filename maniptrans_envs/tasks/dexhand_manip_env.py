@@ -918,8 +918,8 @@ class DexHandManipEnv(DirectRLEnv):
                     max_angular_velocity=100.0,
                 ),
                 collision_props=sim_utils.CollisionPropertiesCfg(
-                    contact_offset=0.005,   # Match original ManipTrans
-                    rest_offset=0.0,        # Match original ManipTrans
+                    contact_offset=0.002,   # Reduced from 0.005 for tighter contact (original thickness=0.001)
+                    rest_offset=0.0,
                 ),
                 articulation_props=sim_utils.ArticulationRootPropertiesCfg(
                     enabled_self_collisions=self.dexhand.self_collision,
@@ -986,8 +986,8 @@ class DexHandManipEnv(DirectRLEnv):
                         max_angular_velocity=100.0,         # Match original: prevent object spinning
                     ),
                     collision_props=sim_utils.CollisionPropertiesCfg(
-                        contact_offset=0.005,   # Match original ManipTrans
-                        rest_offset=0.0,        # Match original ManipTrans
+                        contact_offset=0.002,   # Reduced from 0.005 for tighter contact (original thickness=0.001)
+                        rest_offset=0.0,
                     ),
                     mass_props=sim_utils.MassPropertiesCfg(
                         density=200.0,  # Match original: average density of 3D-printed models
@@ -1012,7 +1012,7 @@ class DexHandManipEnv(DirectRLEnv):
                         density=200.0,
                     ),
                     collision_props=sim_utils.CollisionPropertiesCfg(
-                        contact_offset=0.005,
+                        contact_offset=0.002,
                         rest_offset=0.0,
                     ),
                 ),
@@ -1250,21 +1250,21 @@ class DexHandManipEnv(DirectRLEnv):
             print(f"[WARNING] Could not get object COM: {e}, using zeros")
             self.manip_obj_com[:] = 0.0
 
-        # Set object friction to match original ManipTrans (2.0, not the global 4.0)
-        # Original: element.friction = 2.0 (compensates for missing skin deformation friction)
-        # The global physics_material (4.0) is for the hand; object needs different value.
+        # Set object friction higher than original ManipTrans (2.0 → 3.0)
+        # Original IsaacGym: friction=2.0 + rolling_friction=0.05 + torsion_friction=0.05
+        # IsaacLab PhysX5 doesn't support rolling/torsion friction via tensor API,
+        # so we compensate by increasing static/dynamic friction.
         try:
             mat_props = self.object.root_physx_view.get_material_properties()  # (num_envs, num_shapes, 3)
             # mat_props[..., 0] = static_friction, [..1] = dynamic_friction, [..2] = restitution
-            # Override to match original ManipTrans object friction = 2.0
-            mat_props[:, :, 0] = 2.0  # static friction
-            mat_props[:, :, 1] = 2.0  # dynamic friction
+            mat_props[:, :, 0] = 3.0  # static friction (was 2.0, increased to compensate rolling/torsion)
+            mat_props[:, :, 1] = 3.0  # dynamic friction (was 2.0, increased to compensate rolling/torsion)
             env_indices = torch.arange(self.num_envs, device="cpu")
             self.object.root_physx_view.set_material_properties(mat_props, env_indices)
             # Now store these as "original" for friction curriculum
             self._original_obj_static_friction = mat_props[:, :, 0].clone()
             self._original_obj_dynamic_friction = mat_props[:, :, 1].clone()
-            print(f"[INFO] Object friction set to match original ManipTrans: static=2.00, dynamic=2.00")
+            print(f"[INFO] Object friction set: static=3.00, dynamic=3.00 (compensating missing rolling/torsion)")
         except Exception as e:
             print(f"[WARNING] Could not set object material properties: {e}")
             self._original_obj_static_friction = None

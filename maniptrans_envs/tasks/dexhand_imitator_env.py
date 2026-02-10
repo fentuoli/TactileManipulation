@@ -515,7 +515,7 @@ class DexHandImitatorEnv(DirectRLEnv):
                     max_angular_velocity=100.0,
                 ),
                 collision_props=sim_utils.CollisionPropertiesCfg(
-                    contact_offset=0.005,
+                    contact_offset=0.002,   # Reduced from 0.005 for tighter contact (original thickness=0.001)
                     rest_offset=0.0,
                 ),
                 articulation_props=sim_utils.ArticulationRootPropertiesCfg(
