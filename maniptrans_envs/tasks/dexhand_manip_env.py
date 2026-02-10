@@ -1154,6 +1154,16 @@ class DexHandManipEnv(DirectRLEnv):
             imit_obs = self._compute_imitator_obs()
             imit_obs = torch.nan_to_num(imit_obs, nan=0.0)
             self._base_action_buf = self.imitator_policy(imit_obs)
+            # Periodic diagnostic logging (every 500 steps)
+            if self.global_step_count % 500 == 0 and self.global_step_count > 0:
+                a = self._base_action_buf
+                force_norm = a[:, :3].norm(dim=-1).mean().item()
+                torque_norm = a[:, 3:6].norm(dim=-1).mean().item()
+                dof_mean = a[:, 6:].abs().mean().item()
+                print(f"[IMIT-DIAG step={self.global_step_count}] "
+                      f"force_norm={force_norm:.4f}, torque_norm={torque_norm:.4f}, "
+                      f"dof_abs_mean={dof_mean:.4f}, "
+                      f"range=[{a.min().item():.3f}, {a.max().item():.3f}]")
         else:
             self._base_action_buf.zero_()
         return self._base_action_buf
@@ -1585,21 +1595,13 @@ class DexHandManipEnv(DirectRLEnv):
         target_wrist_rot = indicing(self.demo_data["wrist_rot"], cur_idx)
         cur_wrist_rot_wxyz = self.hand_root_state[:, 3:7]  # wxyz from IsaacLab
         wrist_quat_wxyz = aa_to_quat(target_wrist_rot.reshape(nE * nF, -1))  # wxyz from pytorch3d
-        if self.cfg.use_isaacgym_imitator:
-            # Convert to xyzw for IsaacGym-trained imitator
-            cur_wrist_rot = wxyz_to_xyzw(cur_wrist_rot_wxyz)
-            wrist_quat = wxyz_to_xyzw(wrist_quat_wxyz)
-            delta_wrist_quat = quat_mul_xyzw(
-                cur_wrist_rot[:, None].repeat(1, nF, 1).reshape(nE * nF, -1),
-                quat_conjugate_xyzw(wrist_quat),
-            ).reshape(nE, -1)
-        else:
-            # Keep wxyz for IsaacLab-trained imitator
-            wrist_quat = wrist_quat_wxyz
-            delta_wrist_quat = quat_mul(
-                cur_wrist_rot_wxyz[:, None].repeat(1, nF, 1).reshape(nE * nF, -1),
-                quat_conjugate(wrist_quat),
-            ).reshape(nE, -1)
+        # PPO observations use consistent wxyz throughout (matching prop_obs/priv_obs).
+        # use_isaacgym_imitator only affects _compute_imitator_obs(), not PPO target obs.
+        wrist_quat = wrist_quat_wxyz
+        delta_wrist_quat = quat_mul(
+            cur_wrist_rot_wxyz[:, None].repeat(1, nF, 1).reshape(nE * nF, -1),
+            quat_conjugate(wrist_quat),
+        ).reshape(nE, -1)
         wrist_quat = wrist_quat.reshape(nE, -1)
 
         target_wrist_ang_vel = indicing(self.demo_data["wrist_angular_velocity"], cur_idx)
@@ -1629,21 +1631,12 @@ class DexHandManipEnv(DirectRLEnv):
         delta_manip_obj_vel = (target_obj_vel - self.object_linvel[:, None]).reshape(nE, -1)
 
         manip_obj_quat_wxyz = rotmat_to_quat(target_obj_transf[:, :3, :3])  # wxyz from pytorch3d
-        if self.cfg.use_isaacgym_imitator:
-            # Convert to xyzw for IsaacGym-trained imitator
-            manip_obj_quat = wxyz_to_xyzw(manip_obj_quat_wxyz)
-            cur_obj_rot_xyzw = wxyz_to_xyzw(self.object_rot)
-            delta_manip_obj_quat = quat_mul_xyzw(
-                cur_obj_rot_xyzw[:, None].repeat(1, nF, 1).reshape(nE * nF, -1),
-                quat_conjugate_xyzw(manip_obj_quat),
-            ).reshape(nE, -1)
-        else:
-            # Keep wxyz for IsaacLab-trained imitator
-            manip_obj_quat = manip_obj_quat_wxyz
-            delta_manip_obj_quat = quat_mul(
-                self.object_rot[:, None].repeat(1, nF, 1).reshape(nE * nF, -1),
-                quat_conjugate(manip_obj_quat),
-            ).reshape(nE, -1)
+        # PPO observations use consistent wxyz (matching prop_obs/priv_obs)
+        manip_obj_quat = manip_obj_quat_wxyz
+        delta_manip_obj_quat = quat_mul(
+            self.object_rot[:, None].repeat(1, nF, 1).reshape(nE * nF, -1),
+            quat_conjugate(manip_obj_quat),
+        ).reshape(nE, -1)
         manip_obj_quat = manip_obj_quat.reshape(nE, -1)
 
         target_obj_ang_vel = indicing(self.demo_data["obj_angular_velocity"], cur_idx)
