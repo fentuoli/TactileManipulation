@@ -1257,8 +1257,8 @@ class DexHandManipEnv(DirectRLEnv):
         try:
             mat_props = self.object.root_physx_view.get_material_properties()  # (num_envs, num_shapes, 3)
             # mat_props[..., 0] = static_friction, [..1] = dynamic_friction, [..2] = restitution
-            mat_props[:, :, 0] = 3.0  # static friction (was 2.0, increased to compensate rolling/torsion)
-            mat_props[:, :, 1] = 3.0  # dynamic friction (was 2.0, increased to compensate rolling/torsion)
+            mat_props[:, :, 0] = 4.0  # static friction (was 2.0, increased to compensate rolling/torsion)
+            mat_props[:, :, 1] = 4.0  # dynamic friction (was 2.0, increased to compensate rolling/torsion)
             env_indices = torch.arange(self.num_envs, device="cpu")
             self.object.root_physx_view.set_material_properties(mat_props, env_indices)
             # Now store these as "original" for friction curriculum
