@@ -87,6 +87,8 @@ class DexHandManipEnvCfg(DirectRLEnvCfg):
         ),
         physx=PhysxCfg(
             bounce_threshold_velocity=0.2,
+            friction_offset_threshold=0.01,        # Match original ManipTrans
+            friction_correlation_distance=0.0005,   # Match original ManipTrans
             gpu_found_lost_aggregate_pairs_capacity=1024 * 1024 * 4,
             gpu_total_aggregate_pairs_capacity=16 * 1024,
         ),
@@ -636,7 +638,7 @@ class DexHandManipEnv(DirectRLEnv):
                 ),
                 rigid_props=sim_utils.RigidBodyPropertiesCfg(
                     disable_gravity=True,
-                    max_depenetration_velocity=10.0,
+                    max_depenetration_velocity=1000.0,  # Match original ManipTrans global setting
                     linear_damping=20.0,   # Prevent flying (same as original)
                     angular_damping=20.0,  # Prevent flying (same as original)
                     max_linear_velocity=50.0,
@@ -649,7 +651,7 @@ class DexHandManipEnv(DirectRLEnv):
                 articulation_props=sim_utils.ArticulationRootPropertiesCfg(
                     enabled_self_collisions=self.dexhand.self_collision,
                     solver_position_iteration_count=8,
-                    solver_velocity_iteration_count=0,
+                    solver_velocity_iteration_count=1,  # Match original (0 = friction not solved)
                 ),
             ),
             init_state=ArticulationCfg.InitialStateCfg(
