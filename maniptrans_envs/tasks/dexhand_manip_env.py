@@ -89,8 +89,6 @@ class DexHandManipEnvCfg(DirectRLEnvCfg):
             bounce_threshold_velocity=0.2,
             gpu_found_lost_aggregate_pairs_capacity=1024 * 1024 * 4,
             gpu_total_aggregate_pairs_capacity=16 * 1024,
-            # Matching original ManipTrans PhysX config
-            max_depenetration_velocity=1000.0,
         ),
         gravity=(0.0, 0.0, -9.81),
     )
