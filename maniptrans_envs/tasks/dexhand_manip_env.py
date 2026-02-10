@@ -62,108 +62,170 @@ ROBOT_HEIGHT = 0.00214874
 
 
 class ImitatorPolicy(torch.nn.Module):
-    """Lightweight inference-only wrapper for loading frozen imitator RL Games checkpoints.
+    """Frozen imitator policy loaded from RL Games DictObsNetwork checkpoint.
 
-    Reconstructs just the actor MLP + input normalization from an RL Games
-    continuous_a2c_logstd checkpoint. No critic, no sigma — only deterministic
-    mu output for base action computation.
+    Reconstructs the full inference pipeline:
+      1. Reorder flat obs from env order [prop, priv, target] to sorted key order
+         [privileged, proprioception, target] (matching DictObsNetwork behavior)
+      2. Per-key RunningMeanStdObs normalization
+      3. SimpleFeatureFusion._head MLP (feature encoder)
+      4. actor_mlp
+      5. mu (deterministic output)
+
+    Architecture is auto-detected from checkpoint weights.
     """
 
-    def __init__(self, obs_dim: int, action_dim: int, hidden_units=(512, 256, 128)):
+    def __init__(self, feature_head, actor_mlp, mu,
+                 running_mean, running_var, obs_reorder_indices):
         super().__init__()
-        # Running mean/std for input normalization (matches RL Games running_mean_std)
-        self.running_mean = torch.nn.Parameter(torch.zeros(obs_dim), requires_grad=False)
-        self.running_var = torch.nn.Parameter(torch.ones(obs_dim), requires_grad=False)
-
-        # Actor MLP (matches RL Games a2c_network.actor_mlp)
-        layers = []
-        in_dim = obs_dim
-        for h in hidden_units:
-            layers.extend([torch.nn.Linear(in_dim, h), torch.nn.ELU()])
-            in_dim = h
-        self.actor_mlp = torch.nn.Sequential(*layers)
-        self.mu = torch.nn.Linear(in_dim, action_dim)
+        self.feature_head = feature_head
+        self.actor_mlp = actor_mlp
+        self.mu = mu
+        self.running_mean = torch.nn.Parameter(running_mean.float(), requires_grad=False)
+        self.running_var = torch.nn.Parameter(running_var.float(), requires_grad=False)
+        self.register_buffer('obs_reorder_indices', obs_reorder_indices)
 
     @torch.no_grad()
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        """Deterministic forward pass: normalize → MLP → mu."""
+        """Deterministic forward: reorder → normalize → feature_head → actor_mlp → mu."""
+        # Reorder from env order [prop, priv, target] to sorted key order [priv, prop, target]
+        obs = obs[:, self.obs_reorder_indices]
+        # Per-key running mean/std normalization (concatenated in sorted key order)
         obs = (obs - self.running_mean) / torch.sqrt(self.running_var + 1e-5)
-        obs = torch.clamp(obs, -5.0, 5.0)
-        x = self.actor_mlp(obs)
+        obs = torch.clamp(obs, -20.0, 20.0)  # Match RL Games RunningMeanStd clamp
+        # Feature encoder head (SimpleFeatureFusion._head)
+        x = self.feature_head(obs)
+        # Actor MLP
+        x = self.actor_mlp(x)
+        # Output
         return self.mu(x)
 
     @classmethod
-    def from_rl_games_checkpoint(cls, path: str, obs_dim: int, action_dim: int,
-                                  hidden_units=(512, 256, 128), device="cuda"):
-        """Load from an RL Games checkpoint file.
+    def from_rl_games_checkpoint(cls, path: str, prop_dim: int, priv_dim: int,
+                                  target_dim: int, device="cuda"):
+        """Load from an RL Games DictObsNetwork checkpoint.
 
-        Maps RL Games state dict keys to our simplified model:
-          a2c_network.actor_mlp.{i}.weight/bias → actor_mlp.{i}.weight/bias
-          a2c_network.mu.weight/bias → mu.weight/bias
-          running_mean_std.running_mean → running_mean
-          running_mean_std.running_var → running_var
+        Auto-detects network architecture from checkpoint weight shapes.
+        Handles both dict-based RunningMeanStdObs and flat RunningMeanStd.
         """
-        model = cls(obs_dim, action_dim, hidden_units)
         ckpt = torch.load(path, map_location="cpu", weights_only=False)
         state = ckpt["model"]
+        obs_dim = prop_dim + priv_dim + target_dim
 
-        new_state = {}
+        # --- Build obs reorder indices ---
+        # Env obs order: [prop, priv, target]
+        # DictObsNetwork sorted key order: [privileged, proprioception, target]
+        reorder = torch.cat([
+            torch.arange(prop_dim, prop_dim + priv_dim),   # privileged
+            torch.arange(0, prop_dim),                      # proprioception
+            torch.arange(prop_dim + priv_dim, obs_dim),    # target
+        ])
+
+        # --- Build running_mean/var in sorted key order ---
+        key_order = sorted(["privileged", "proprioception", "target"])
+        running_means, running_vars = [], []
+        for key in key_order:
+            rm_key = f"running_mean_std.running_mean_std.{key}.running_mean"
+            rv_key = f"running_mean_std.running_mean_std.{key}.running_var"
+            if rm_key in state:
+                running_means.append(state[rm_key])
+                running_vars.append(state[rv_key])
+
+        if running_means:
+            running_mean = torch.cat(running_means)
+            running_var = torch.cat(running_vars)
+        else:
+            # Fallback: flat RunningMeanStd (non-dict checkpoint)
+            running_mean = state.get("running_mean_std.running_mean", torch.zeros(obs_dim))
+            running_var = state.get("running_mean_std.running_var", torch.ones(obs_dim))
+
+        # --- Build feature encoder head from checkpoint weights ---
+        head_weights = {}
+        for k, v in state.items():
+            if k.startswith("a2c_network.dict_feature_encoder._head."):
+                idx_key = k.replace("a2c_network.dict_feature_encoder._head.", "")
+                head_weights[idx_key] = v
+
+        head_linear_indices = sorted(set(
+            int(k.split('.')[0]) for k in head_weights if k.endswith('.weight')
+        ))
+
+        head_layers = []
+        for i, idx in enumerate(head_linear_indices):
+            w = head_weights[f"{idx}.weight"]
+            b = head_weights[f"{idx}.bias"]
+            linear = torch.nn.Linear(w.shape[1], w.shape[0])
+            linear.weight.data.copy_(w)
+            linear.bias.data.copy_(b)
+            head_layers.append(linear)
+            if i < len(head_linear_indices) - 1:
+                head_layers.append(torch.nn.SiLU())  # swish activation
+        feature_head = torch.nn.Sequential(*head_layers)
+
+        # --- Build actor MLP from checkpoint weights ---
+        mlp_weights = {}
         for k, v in state.items():
             if k.startswith("a2c_network.actor_mlp."):
-                new_key = k.replace("a2c_network.", "")
-                new_state[new_key] = v
-            elif k.startswith("a2c_network.mu."):
-                new_key = k.replace("a2c_network.", "")
-                new_state[new_key] = v
-            elif k == "running_mean_std.running_mean":
-                new_state["running_mean"] = v
-            elif k == "running_mean_std.running_var":
-                new_state["running_var"] = v
-            # Skip: sigma, value, critic, count
+                idx_key = k.replace("a2c_network.actor_mlp.", "")
+                mlp_weights[idx_key] = v
 
-        # Validate key matching
-        expected_keys = set(model.state_dict().keys())
-        matched_keys = set(new_state.keys()) & expected_keys
-        missing_keys = expected_keys - set(new_state.keys())
-        unexpected_keys = set(new_state.keys()) - expected_keys
+        mlp_linear_indices = sorted(set(
+            int(k.split('.')[0]) for k in mlp_weights if k.endswith('.weight')
+        ))
 
-        model.load_state_dict(new_state, strict=False)
+        mlp_layers = []
+        for idx in mlp_linear_indices:
+            w = mlp_weights[f"{idx}.weight"]
+            b = mlp_weights[f"{idx}.bias"]
+            linear = torch.nn.Linear(w.shape[1], w.shape[0])
+            linear.weight.data.copy_(w)
+            linear.bias.data.copy_(b)
+            mlp_layers.append(linear)
+            mlp_layers.append(torch.nn.ELU())
+        actor_mlp = torch.nn.Sequential(*mlp_layers)
+
+        # --- Build mu layer ---
+        mu_w = state["a2c_network.mu.weight"]
+        mu_b = state["a2c_network.mu.bias"]
+        mu = torch.nn.Linear(mu_w.shape[1], mu_w.shape[0])
+        mu.weight.data.copy_(mu_w)
+        mu.bias.data.copy_(mu_b)
+        action_dim = mu_w.shape[0]
+
+        # --- Create model ---
+        model = cls(feature_head, actor_mlp, mu, running_mean, running_var, reorder)
         model.to(device)
         model.eval()
         for param in model.parameters():
             param.requires_grad = False
 
-        # Diagnostic output
-        print(f"[INFO] Loaded imitator policy from {path}")
-        print(f"[INFO]   obs_dim={obs_dim}, action_dim={action_dim}, units={list(hidden_units)}")
-        print(f"[INFO]   Checkpoint keys: {len(state)} total, {len(matched_keys)}/{len(expected_keys)} matched")
-        if missing_keys:
-            print(f"[WARNING]   Missing keys (using defaults): {missing_keys}")
-        if unexpected_keys:
-            print(f"[WARNING]   Unexpected keys (ignored): {unexpected_keys}")
-
-        # Weight statistics
+        # --- Diagnostics ---
         total_params = sum(p.numel() for p in model.parameters())
+        head_dims = [f"{head_weights[f'{idx}.weight'].shape[1]}→{head_weights[f'{idx}.weight'].shape[0]}"
+                     for idx in head_linear_indices]
+        mlp_dims = [f"{mlp_weights[f'{idx}.weight'].shape[1]}→{mlp_weights[f'{idx}.weight'].shape[0]}"
+                    for idx in mlp_linear_indices]
+
+        print(f"[INFO] Loaded imitator policy from {path}")
+        print(f"[INFO]   obs_dim={obs_dim} (prop={prop_dim}, priv={priv_dim}, target={target_dim})")
+        print(f"[INFO]   action_dim={action_dim}")
+        print(f"[INFO]   feature_head: [{' → '.join(head_dims)}] (swish)")
+        print(f"[INFO]   actor_mlp: [{' → '.join(mlp_dims)}] (elu)")
         print(f"[INFO]   Total parameters: {total_params:,}")
 
-        # Running mean/std diagnostics (should NOT be zeros/ones if imitator was trained)
-        rm = model.running_mean
-        rv = model.running_var
+        # Running mean/std diagnostics
+        rm, rv = model.running_mean, model.running_var
         rm_nonzero = (rm.abs() > 1e-6).sum().item()
         rv_nondefault = ((rv - 1.0).abs() > 1e-6).sum().item()
-        print(f"[INFO]   running_mean: {rm_nonzero}/{rm.shape[0]} non-zero "
-              f"(mean={rm.mean().item():.4f}, std={rm.std().item():.4f})")
-        print(f"[INFO]   running_var: {rv_nondefault}/{rv.shape[0]} non-default "
-              f"(mean={rv.mean().item():.4f}, std={rv.std().item():.4f})")
+        print(f"[INFO]   running_mean: {rm_nonzero}/{rm.shape[0]} non-zero")
+        print(f"[INFO]   running_var: {rv_nondefault}/{rv.shape[0]} non-default")
         if rm_nonzero == 0 and rv_nondefault == 0:
-            print(f"[WARNING]   running_mean_std appears untrained (all zeros/ones)!")
+            print(f"[WARNING]   running_mean_std appears untrained!")
 
-        # Test forward pass with dummy input
+        # Test forward pass
         dummy = torch.zeros(1, obs_dim, device=device)
         test_out = model(dummy)
-        out_norm = test_out.norm().item()
-        print(f"[INFO]   Test forward pass: input zeros → output norm={out_norm:.6f}, "
-              f"shape={list(test_out.shape)}")
+        print(f"[INFO]   Test forward: zeros → norm={test_out.norm().item():.6f}, shape={list(test_out.shape)}")
 
         return model
 
@@ -360,7 +422,11 @@ class DexHandManipEnv(DirectRLEnv):
             + n_joint_bodies_imit * 3    # joints_vel
             + n_joint_bodies_imit * 3    # delta_joints_vel
         )
-        self._imitator_obs_dim = (n_dofs * 3 + 13) + n_dofs + imit_target_per_frame  # prop + priv + target (future=1)
+        # Store individual component dims for imitator obs (needed for checkpoint loading)
+        self._imitator_prop_dim = n_dofs * 3 + 13  # q, cos(q), sin(q), base_state
+        self._imitator_priv_dim = n_dofs           # dq only (imitator has no object)
+        self._imitator_target_dim = imit_target_per_frame  # hand-only target (future=1)
+        self._imitator_obs_dim = self._imitator_prop_dim + self._imitator_priv_dim + self._imitator_target_dim
         self._imitator_action_dim = 6 + n_dofs  # imitator always uses force control: 6 wrist + n_dofs
 
         print(f"[INFO] Manip obs dims: prop={prop_obs_dim}, priv={priv_obs_dim}, "
@@ -426,16 +492,15 @@ class DexHandManipEnv(DirectRLEnv):
         if ckpt_path is not None and os.path.exists(ckpt_path):
             file_size_mb = os.path.getsize(ckpt_path) / (1024 * 1024)
             print(f"[INFO] Imitator checkpoint file size: {file_size_mb:.2f} MB")
-            print(f"[INFO] Expected imitator obs_dim={self._imitator_obs_dim}, action_dim={self._imitator_action_dim}")
             self.imitator_policy = ImitatorPolicy.from_rl_games_checkpoint(
                 path=ckpt_path,
-                obs_dim=self._imitator_obs_dim,
-                action_dim=self._imitator_action_dim,
-                hidden_units=(512, 256, 128),
+                prop_dim=self._imitator_prop_dim,
+                priv_dim=self._imitator_priv_dim,
+                target_dim=self._imitator_target_dim,
                 device=str(self.device),
             )
             self._has_imitator = True
-            # Batch-size test forward pass
+            # Batch-size validation with random input
             dummy_batch = torch.randn(min(4, self.num_envs), self._imitator_obs_dim, device=self.device)
             test_actions = self.imitator_policy(dummy_batch)
             print(f"[INFO] Imitator batch test: input({list(dummy_batch.shape)}) → "
