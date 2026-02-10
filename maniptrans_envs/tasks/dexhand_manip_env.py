@@ -34,6 +34,29 @@ from main.dataset.factory import ManipDataFactory
 from main.dataset.transform import aa_to_quat, aa_to_rotmat, quat_to_rotmat, rotmat_to_aa, rotmat_to_quat, rot6d_to_aa
 
 
+# Quaternion format conversion helpers
+# IsaacLab uses wxyz format; IsaacGym-trained imitators expect xyzw format.
+def wxyz_to_xyzw(quat: torch.Tensor) -> torch.Tensor:
+    """Convert quaternion from wxyz (IsaacLab) to xyzw (IsaacGym) format."""
+    return quat[..., [1, 2, 3, 0]]
+
+
+def quat_mul_xyzw(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Quaternion multiplication for xyzw format (IsaacGym convention)."""
+    ax, ay, az, aw = a[..., 0], a[..., 1], a[..., 2], a[..., 3]
+    bx, by, bz, bw = b[..., 0], b[..., 1], b[..., 2], b[..., 3]
+    w = aw * bw - ax * bx - ay * by - az * bz
+    x = aw * bx + ax * bw + ay * bz - az * by
+    y = aw * by - ax * bz + ay * bw + az * bx
+    z = aw * bz + ax * by - ay * bx + az * bw
+    return torch.stack([x, y, z, w], dim=-1)
+
+
+def quat_conjugate_xyzw(q: torch.Tensor) -> torch.Tensor:
+    """Quaternion conjugate for xyzw format."""
+    return torch.cat([-q[..., :3], q[..., 3:4]], dim=-1)
+
+
 # Configuration constants
 ROBOT_HEIGHT = 0.15
 
@@ -87,6 +110,7 @@ class DexHandManipEnvCfg(DirectRLEnvCfg):
     translation_scale: float = 1.0
     orientation_scale: float = 0.1
     use_pid_control: bool = False
+    use_isaacgym_imitator: bool = True  # True: obs quaternions in xyzw (IsaacGym); False: wxyz (IsaacLab)
 
     # Training settings
     training: bool = True
@@ -943,12 +967,23 @@ class DexHandManipEnv(DirectRLEnv):
         delta_wrist_vel = (target_wrist_vel - cur_wrist_vel[:, None]).reshape(nE, -1)
 
         target_wrist_rot = indicing(self.demo_data["wrist_rot"], cur_idx)
-        cur_wrist_rot = self.hand_root_state[:, 3:7]
-        wrist_quat = aa_to_quat(target_wrist_rot.reshape(nE * nF, -1))
-        delta_wrist_quat = quat_mul(
-            cur_wrist_rot[:, None].repeat(1, nF, 1).reshape(nE * nF, -1),
-            quat_conjugate(wrist_quat),
-        ).reshape(nE, -1)
+        cur_wrist_rot_wxyz = self.hand_root_state[:, 3:7]  # wxyz from IsaacLab
+        wrist_quat_wxyz = aa_to_quat(target_wrist_rot.reshape(nE * nF, -1))  # wxyz from pytorch3d
+        if self.cfg.use_isaacgym_imitator:
+            # Convert to xyzw for IsaacGym-trained imitator
+            cur_wrist_rot = wxyz_to_xyzw(cur_wrist_rot_wxyz)
+            wrist_quat = wxyz_to_xyzw(wrist_quat_wxyz)
+            delta_wrist_quat = quat_mul_xyzw(
+                cur_wrist_rot[:, None].repeat(1, nF, 1).reshape(nE * nF, -1),
+                quat_conjugate_xyzw(wrist_quat),
+            ).reshape(nE, -1)
+        else:
+            # Keep wxyz for IsaacLab-trained imitator
+            wrist_quat = wrist_quat_wxyz
+            delta_wrist_quat = quat_mul(
+                cur_wrist_rot_wxyz[:, None].repeat(1, nF, 1).reshape(nE * nF, -1),
+                quat_conjugate(wrist_quat),
+            ).reshape(nE, -1)
         wrist_quat = wrist_quat.reshape(nE, -1)
 
         target_wrist_ang_vel = indicing(self.demo_data["wrist_angular_velocity"], cur_idx)
@@ -977,11 +1012,22 @@ class DexHandManipEnv(DirectRLEnv):
         manip_obj_vel = target_obj_vel.reshape(nE, -1)
         delta_manip_obj_vel = (target_obj_vel - self.object_linvel[:, None]).reshape(nE, -1)
 
-        manip_obj_quat = rotmat_to_quat(target_obj_transf[:, :3, :3])
-        delta_manip_obj_quat = quat_mul(
-            self.object_rot[:, None].repeat(1, nF, 1).reshape(nE * nF, -1),
-            quat_conjugate(manip_obj_quat),
-        ).reshape(nE, -1)
+        manip_obj_quat_wxyz = rotmat_to_quat(target_obj_transf[:, :3, :3])  # wxyz from pytorch3d
+        if self.cfg.use_isaacgym_imitator:
+            # Convert to xyzw for IsaacGym-trained imitator
+            manip_obj_quat = wxyz_to_xyzw(manip_obj_quat_wxyz)
+            cur_obj_rot_xyzw = wxyz_to_xyzw(self.object_rot)
+            delta_manip_obj_quat = quat_mul_xyzw(
+                cur_obj_rot_xyzw[:, None].repeat(1, nF, 1).reshape(nE * nF, -1),
+                quat_conjugate_xyzw(manip_obj_quat),
+            ).reshape(nE, -1)
+        else:
+            # Keep wxyz for IsaacLab-trained imitator
+            manip_obj_quat = manip_obj_quat_wxyz
+            delta_manip_obj_quat = quat_mul(
+                self.object_rot[:, None].repeat(1, nF, 1).reshape(nE * nF, -1),
+                quat_conjugate(manip_obj_quat),
+            ).reshape(nE, -1)
         manip_obj_quat = manip_obj_quat.reshape(nE, -1)
 
         target_obj_ang_vel = indicing(self.demo_data["obj_angular_velocity"], cur_idx)
