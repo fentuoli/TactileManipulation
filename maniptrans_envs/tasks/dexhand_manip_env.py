@@ -57,8 +57,8 @@ class DexHandManipEnvCfg(DirectRLEnvCfg):
         dt=1 / 120,
         render_interval=2,
         physics_material=RigidBodyMaterialCfg(
-            static_friction=1.0,
-            dynamic_friction=1.0,
+            static_friction=4.0,
+            dynamic_friction=4.0,
         ),
         physx=PhysxCfg(
             bounce_threshold_velocity=0.2,
@@ -83,9 +83,9 @@ class DexHandManipEnvCfg(DirectRLEnvCfg):
     # Action/Observation settings
     use_quat_rot: bool = True
     action_scale: float = 1.0
-    act_moving_average: float = 0.9
+    act_moving_average: float = 0.4
     translation_scale: float = 1.0
-    orientation_scale: float = 1.0
+    orientation_scale: float = 0.1
     use_pid_control: bool = False
 
     # Training settings
@@ -97,14 +97,14 @@ class DexHandManipEnvCfg(DirectRLEnvCfg):
     # Tightening curriculum
     tighten_method: str = "None"  # "None", "const", "linear_decay", "exp_decay", "cos"
     tighten_factor: float = 0.7
-    tighten_steps: int = 100000
+    tighten_steps: int = 3200
 
     # Rollout settings (optional)
     rollout_len: int | None = None
     rollout_begin: int | None = None
 
     # Max episode length
-    max_episode_length: int = 1000
+    max_episode_length: int = 1200
 
 
 @configclass
@@ -350,6 +350,32 @@ class DexHandManipEnv(DirectRLEnv):
             self.wrist_body_idx = 0
         print(f"[INFO] Wrist body index: {self.wrist_body_idx} (name: {wrist_body_name})")
 
+        # Build body reorder mapping: dexhand body order (excluding wrist) -> IsaacLab body indices
+        # This is needed to compare FK body positions with demo mano_joints data
+        wrist_name = self.dexhand.to_dex("wrist")[0]
+        self.demo_body_to_isaaclab_indices = []
+        for body_name in self.dexhand.body_names:
+            if body_name == wrist_name:
+                continue  # Skip wrist, mano_joints excludes it
+            if body_name in self.body_name_to_idx:
+                self.demo_body_to_isaaclab_indices.append(self.body_name_to_idx[body_name])
+            else:
+                print(f"[WARNING] Body '{body_name}' not found in IsaacLab bodies!")
+                self.demo_body_to_isaaclab_indices.append(0)
+        self.demo_body_to_isaaclab_indices = torch.tensor(
+            self.demo_body_to_isaaclab_indices, device=self.device, dtype=torch.long
+        )
+        print(f"[INFO] Demo body to IsaacLab indices (excl wrist): {self.demo_body_to_isaaclab_indices.tolist()}")
+
+        # Contact body indices in IsaacLab order (for fingertip contact force)
+        self.contact_body_indices = []
+        for name in self.dexhand.contact_body_names:
+            if name in self.body_name_to_idx:
+                self.contact_body_indices.append(self.body_name_to_idx[name])
+            else:
+                print(f"[WARNING] Contact body '{name}' not found in articulation!")
+        print(f"[INFO] Contact body indices: {self.contact_body_indices}")
+
         # Verify joint count matches expected
         if self._actual_num_joints != self.dexhand.n_dofs:
             print(f"[WARNING] Joint count mismatch! IsaacLab has {self._actual_num_joints} joints, expected {self.dexhand.n_dofs}")
@@ -442,6 +468,9 @@ class DexHandManipEnv(DirectRLEnv):
             self.Kp_pos = self.dexhand.Kp_pos
             self.Ki_pos = self.dexhand.Ki_pos
             self.Kd_pos = self.dexhand.Kd_pos
+
+        # Curriculum learning step counter
+        self.global_step_count = 0
 
         # Best rollout tracking (for curriculum)
         self.best_rollout_len = 0
@@ -720,9 +749,16 @@ class DexHandManipEnv(DirectRLEnv):
         self.prev_targets[:] = self.curr_targets[:]
         self.hand.set_joint_position_target(self.curr_targets)
 
-        # Apply external forces to wrist
-        # Note: In IsaacLab, force application is handled differently
-        # This may need adjustment based on the actual IsaacLab API
+        # Apply external forces/torques to wrist via IsaacLab API
+        # Equivalent to IsaacGym's gym.apply_rigid_body_force_tensors(..., gymapi.ENV_SPACE)
+        # set_external_force_and_torque buffers the wrench; scene.write_data_to_sim() applies it
+        self.hand.set_external_force_and_torque(
+            forces=self.apply_forces,
+            torques=self.apply_torques,
+            body_ids=None,       # all bodies (only wrist_body_idx has non-zero values)
+            env_ids=None,        # all environments
+            is_global=True,      # ENV_SPACE = global/world frame
+        )
 
     def _apply_pid_control(self, base_action, residual_action, root_control_dim):
         """Apply PID-based wrist control."""
@@ -845,6 +881,17 @@ class DexHandManipEnv(DirectRLEnv):
             root_ang_vel,
         ], dim=-1)
 
+        # All body positions in demo order (excluding wrist) for reward computation
+        all_body_pos_isaaclab = self.hand.data.body_pos_w - self.scene.env_origins.unsqueeze(1)
+        self.hand_body_pos = all_body_pos_isaaclab[:, self.demo_body_to_isaaclab_indices]  # (nE, n_bodies-1, 3)
+
+        # Body velocities: try body_vel_w (6D) first, fallback to body_link_vel_w
+        try:
+            all_body_vel = self.hand.data.body_vel_w  # (num_envs, num_bodies, 6)
+        except AttributeError:
+            all_body_vel = self.hand.data.body_link_vel_w  # newer IsaacLab versions
+        self.hand_body_vel = all_body_vel[:, self.demo_body_to_isaaclab_indices, :3]  # linear vel only
+
         # Fingertip data
         self.fingertip_pos = self.hand.data.body_pos_w[:, self.fingertip_indices]
         self.fingertip_pos -= self.scene.env_origins.unsqueeze(1)
@@ -854,6 +901,15 @@ class DexHandManipEnv(DirectRLEnv):
         self.object_rot = self.object.data.root_quat_w
         self.object_linvel = self.object.data.root_lin_vel_w
         self.object_angvel = self.object.data.root_ang_vel_w
+
+        # Contact forces for reward computation
+        try:
+            net_cf = self.hand.root_physx_view.get_net_contact_forces(dt=self.physics_dt)
+            self.net_contact_forces = net_cf.view(self.num_envs, -1, 3)
+        except Exception:
+            self.net_contact_forces = torch.zeros(
+                self.num_envs, self._actual_num_bodies, 3, device=self.device
+            )
 
     def _compute_target_observations(self) -> torch.Tensor:
         """Compute target observations from demo data."""
@@ -900,14 +956,15 @@ class DexHandManipEnv(DirectRLEnv):
         wrist_ang_vel = target_wrist_ang_vel.reshape(nE, -1)
         delta_wrist_ang_vel = (target_wrist_ang_vel - cur_wrist_ang_vel[:, None]).reshape(nE, -1)
 
-        # Joint targets
+        # Joint targets (body positions excluding wrist, in demo order)
         target_joints_pos = indicing(self.demo_data["mano_joints"], cur_idx).reshape(nE, nF, -1, 3)
-        # Note: cur_joint_pos requires body state access which needs proper body indexing
-        delta_joints_pos = target_joints_pos.reshape(nE, -1)  # Simplified for now
+        cur_joints_pos = self.hand_body_pos  # (nE, n_bodies-1, 3) already in demo order
+        delta_joints_pos = (target_joints_pos - cur_joints_pos[:, None]).reshape(nE, -1)
 
         target_joints_vel = indicing(self.demo_data["mano_joints_velocity"], cur_idx).reshape(nE, nF, -1, 3)
+        cur_joints_vel = self.hand_body_vel  # (nE, n_bodies-1, 3) already in demo order
         joints_vel = target_joints_vel.reshape(nE, -1)
-        delta_joints_vel = target_joints_vel.reshape(nE, -1)  # Simplified for now
+        delta_joints_vel = (target_joints_vel - cur_joints_vel[:, None]).reshape(nE, -1)
 
         # Object targets
         target_obj_transf = indicing(self.demo_data["obj_trajectory"], cur_idx)
@@ -969,49 +1026,170 @@ class DexHandManipEnv(DirectRLEnv):
         return target_obs
 
     def _get_rewards(self) -> torch.Tensor:
-        """Compute rewards based on imitation error."""
-        # Get current and target states
+        """Compute rewards based on imitation error (matching original ManipTrans 19-term reward)."""
         cur_idx = self.episode_length_buf
+        env_arange = torch.arange(self.num_envs, device=self.device)
 
-        # Current states
+        # --- Current states ---
         current_eef_pos = self.hand_root_state[:, :3]
         current_eef_quat = self.hand_root_state[:, 3:7]
         current_eef_vel = self.hand_root_state[:, 7:10]
         current_eef_ang_vel = self.hand_root_state[:, 10:13]
-
         current_obj_pos = self.object_pos
         current_obj_quat = self.object_rot
         current_obj_vel = self.object_linvel
         current_obj_ang_vel = self.object_angvel
 
-        # Target states from demo data
-        target_eef_pos = self.demo_data["wrist_pos"][torch.arange(self.num_envs), cur_idx]
-        target_eef_quat = aa_to_quat(self.demo_data["wrist_rot"][torch.arange(self.num_envs), cur_idx])
-        target_obj_transf = self.demo_data["obj_trajectory"][torch.arange(self.num_envs), cur_idx]
+        # --- Target states from demo data ---
+        target_eef_pos = self.demo_data["wrist_pos"][env_arange, cur_idx]
+        target_eef_quat = aa_to_quat(self.demo_data["wrist_rot"][env_arange, cur_idx])
+        target_eef_vel = self.demo_data["wrist_velocity"][env_arange, cur_idx]
+        target_eef_ang_vel = self.demo_data["wrist_angular_velocity"][env_arange, cur_idx]
+
+        target_obj_transf = self.demo_data["obj_trajectory"][env_arange, cur_idx]
         target_obj_pos = target_obj_transf[:, :3, 3]
         target_obj_quat = rotmat_to_quat(target_obj_transf[:, :3, :3])
-        # Position rewards
+        target_obj_vel = self.demo_data["obj_velocity"][env_arange, cur_idx]
+        target_obj_ang_vel = self.demo_data["obj_angular_velocity"][env_arange, cur_idx]
+
+        # --- End effector rewards ---
         diff_eef_pos_dist = torch.norm(target_eef_pos - current_eef_pos, dim=-1)
         reward_eef_pos = torch.exp(-40 * diff_eef_pos_dist)
 
+        diff_eef_rot = quat_mul(target_eef_quat, quat_conjugate(current_eef_quat))
+        # w is at index 0 in IsaacLab's wxyz quaternion convention
+        diff_eef_rot_angle = 2.0 * torch.acos(torch.clamp(torch.abs(diff_eef_rot[:, 0]), max=1.0))
+        reward_eef_rot = torch.exp(-1 * diff_eef_rot_angle.abs())
+
+        diff_eef_vel = target_eef_vel - current_eef_vel
+        reward_eef_vel = torch.exp(-1 * diff_eef_vel.abs().mean(dim=-1))
+
+        diff_eef_ang_vel = target_eef_ang_vel - current_eef_ang_vel
+        reward_eef_ang_vel = torch.exp(-1 * diff_eef_ang_vel.abs().mean(dim=-1))
+
+        # --- Joint position rewards (body positions in demo order, excluding wrist) ---
+        joints_pos = self.hand_body_pos  # (nE, n_bodies-1, 3) in demo order
+        target_joints_pos = self.demo_data["mano_joints"][env_arange, cur_idx].reshape(
+            self.num_envs, -1, 3
+        )
+        diff_joints_pos = target_joints_pos - joints_pos
+        diff_joints_pos_dist = torch.norm(diff_joints_pos, dim=-1)  # (nE, n_bodies-1)
+
+        # Per-group joint distances using weight_idx (indices are in body_names order, -1 for wrist skip)
+        weight_idx = self.dexhand.weight_idx
+        diff_thumb_tip_pos_dist = diff_joints_pos_dist[:, [k - 1 for k in weight_idx["thumb_tip"]]].mean(dim=-1)
+        diff_index_tip_pos_dist = diff_joints_pos_dist[:, [k - 1 for k in weight_idx["index_tip"]]].mean(dim=-1)
+        diff_middle_tip_pos_dist = diff_joints_pos_dist[:, [k - 1 for k in weight_idx["middle_tip"]]].mean(dim=-1)
+        diff_ring_tip_pos_dist = diff_joints_pos_dist[:, [k - 1 for k in weight_idx["ring_tip"]]].mean(dim=-1)
+        diff_pinky_tip_pos_dist = diff_joints_pos_dist[:, [k - 1 for k in weight_idx["pinky_tip"]]].mean(dim=-1)
+        diff_level_1_pos_dist = diff_joints_pos_dist[:, [k - 1 for k in weight_idx["level_1_joints"]]].mean(dim=-1)
+        diff_level_2_pos_dist = diff_joints_pos_dist[:, [k - 1 for k in weight_idx["level_2_joints"]]].mean(dim=-1)
+
+        reward_thumb_tip_pos = torch.exp(-100 * diff_thumb_tip_pos_dist)
+        reward_index_tip_pos = torch.exp(-90 * diff_index_tip_pos_dist)
+        reward_middle_tip_pos = torch.exp(-80 * diff_middle_tip_pos_dist)
+        reward_pinky_tip_pos = torch.exp(-60 * diff_pinky_tip_pos_dist)
+        reward_ring_tip_pos = torch.exp(-60 * diff_ring_tip_pos_dist)
+        reward_level_1_pos = torch.exp(-50 * diff_level_1_pos_dist)
+        reward_level_2_pos = torch.exp(-40 * diff_level_2_pos_dist)
+
+        # --- Joint velocity reward ---
+        joints_vel = self.hand_body_vel  # (nE, n_bodies-1, 3) in demo order
+        target_joints_vel = self.demo_data["mano_joints_velocity"][env_arange, cur_idx].reshape(
+            self.num_envs, -1, 3
+        )
+        diff_joints_vel = target_joints_vel - joints_vel
+        reward_joints_vel = torch.exp(-1 * diff_joints_vel.abs().mean(dim=-1).mean(-1))
+
+        # --- Object rewards ---
         diff_obj_pos_dist = torch.norm(target_obj_pos - current_obj_pos, dim=-1)
         reward_obj_pos = torch.exp(-80 * diff_obj_pos_dist)
 
-        # Rotation rewards
-        diff_eef_rot = quat_mul(target_eef_quat, quat_conjugate(current_eef_quat))
-        diff_eef_rot_angle = 2.0 * torch.acos(torch.clamp(torch.abs(diff_eef_rot[:, 3]), max=1.0))
-        reward_eef_rot = torch.exp(-1 * diff_eef_rot_angle.abs())
-
         diff_obj_rot = quat_mul(target_obj_quat, quat_conjugate(current_obj_quat))
-        diff_obj_rot_angle = 2.0 * torch.acos(torch.clamp(torch.abs(diff_obj_rot[:, 3]), max=1.0))
+        diff_obj_rot_angle = 2.0 * torch.acos(torch.clamp(torch.abs(diff_obj_rot[:, 0]), max=1.0))
         reward_obj_rot = torch.exp(-3 * diff_obj_rot_angle.abs())
 
-        # Combined reward
+        diff_obj_vel = target_obj_vel - current_obj_vel
+        reward_obj_vel = torch.exp(-1 * diff_obj_vel.abs().mean(dim=-1))
+
+        diff_obj_ang_vel = target_obj_ang_vel - current_obj_ang_vel
+        reward_obj_ang_vel = torch.exp(-1 * diff_obj_ang_vel.abs().mean(dim=-1))
+
+        # --- Power penalties ---
+        # Joint power: |applied_torque * joint_vel|
+        applied_torque = self.hand.data.applied_torque
+        joint_vel_isaaclab = self.hand.data.joint_vel
+        power = torch.abs(applied_torque * joint_vel_isaaclab).sum(dim=-1)
+        reward_power = torch.exp(-10 * power)
+
+        # Wrist power: |force * lin_vel| + |torque * ang_vel|
+        wrist_force = self.apply_forces[:, self.wrist_body_idx, :]
+        wrist_torque = self.apply_torques[:, self.wrist_body_idx, :]
+        wrist_power = torch.abs(torch.sum(wrist_force * current_eef_vel, dim=-1))
+        wrist_power += torch.abs(torch.sum(wrist_torque * current_eef_ang_vel, dim=-1))
+        reward_wrist_power = torch.exp(-2 * wrist_power)
+
+        # --- Fingertip contact force reward ---
+        finger_tip_distance = self.demo_data["tips_distance"][env_arange, cur_idx]  # (nE, 5)
+        # Get contact forces on contact bodies
+        tip_force = self.net_contact_forces[:, self.contact_body_indices, :]  # (nE, 5, 3)
+
+        # Update contact history
+        self.tips_contact_history = torch.cat([
+            self.tips_contact_history[:, 1:],
+            (torch.norm(tip_force, dim=-1) > 0)[:, None],
+        ], dim=1)
+
+        # Weighted contact force: only encourage contact when demo shows fingertip close to object
+        contact_range_lo, contact_range_hi = 0.02, 0.03
+        finger_tip_weight = torch.clamp(
+            (contact_range_hi - finger_tip_distance) / (contact_range_hi - contact_range_lo), 0, 1
+        )
+        finger_tip_force_masked = tip_force * finger_tip_weight[:, :, None]
+        reward_finger_tip_force = torch.exp(
+            -1 * (1 / (torch.norm(finger_tip_force_masked, dim=-1).sum(-1) + 1e-5))
+        )
+
+        # --- Store intermediate values for termination check ---
+        self._reward_cache = {
+            "diff_obj_pos_dist": diff_obj_pos_dist,
+            "diff_obj_rot_angle": diff_obj_rot_angle,
+            "diff_thumb_tip_pos_dist": diff_thumb_tip_pos_dist,
+            "diff_index_tip_pos_dist": diff_index_tip_pos_dist,
+            "diff_middle_tip_pos_dist": diff_middle_tip_pos_dist,
+            "diff_ring_tip_pos_dist": diff_ring_tip_pos_dist,
+            "diff_pinky_tip_pos_dist": diff_pinky_tip_pos_dist,
+            "diff_level_1_pos_dist": diff_level_1_pos_dist,
+            "diff_level_2_pos_dist": diff_level_2_pos_dist,
+            "finger_tip_distance": finger_tip_distance,
+            "current_eef_vel": current_eef_vel,
+            "current_eef_ang_vel": current_eef_ang_vel,
+            "joints_vel": joints_vel,
+            "current_obj_vel": current_obj_vel,
+            "current_obj_ang_vel": current_obj_ang_vel,
+        }
+
+        # --- Total reward (matching original ManipTrans weights) ---
         reward = (
-            0.1 * reward_eef_pos
-            + 0.6 * reward_eef_rot
-            + 5.0 * reward_obj_pos
-            + 1.0 * reward_obj_rot
+            0.1  * reward_eef_pos
+            + 0.6  * reward_eef_rot
+            + 0.9  * reward_thumb_tip_pos
+            + 0.8  * reward_index_tip_pos
+            + 0.75 * reward_middle_tip_pos
+            + 0.6  * reward_pinky_tip_pos
+            + 0.6  * reward_ring_tip_pos
+            + 0.5  * reward_level_1_pos
+            + 0.3  * reward_level_2_pos
+            + 5.0  * reward_obj_pos
+            + 1.0  * reward_obj_rot
+            + 0.1  * reward_eef_vel
+            + 0.05 * reward_eef_ang_vel
+            + 0.1  * reward_joints_vel
+            + 0.1  * reward_obj_vel
+            + 0.1  * reward_obj_ang_vel
+            + 1.0  * reward_finger_tip_force
+            + 0.5  * reward_power
+            + 0.5  * reward_wrist_power
         )
 
         # Update tracking buffers
@@ -1024,29 +1202,114 @@ class DexHandManipEnv(DirectRLEnv):
         self.extras["log"]["reward_eef_rot"] = reward_eef_rot.mean()
         self.extras["log"]["reward_obj_pos"] = reward_obj_pos.mean()
         self.extras["log"]["reward_obj_rot"] = reward_obj_rot.mean()
+        self.extras["log"]["reward_joints_pos"] = (
+            reward_thumb_tip_pos + reward_index_tip_pos + reward_middle_tip_pos
+            + reward_pinky_tip_pos + reward_ring_tip_pos
+            + reward_level_1_pos + reward_level_2_pos
+        ).mean()
+        self.extras["log"]["reward_power"] = reward_power.mean()
+        self.extras["log"]["reward_wrist_power"] = reward_wrist_power.mean()
+        self.extras["log"]["reward_finger_tip_force"] = reward_finger_tip_force.mean()
 
         return reward
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute termination conditions."""
+        """Compute termination conditions (matching original ManipTrans)."""
         self._compute_intermediate_values()
+        self.global_step_count += 1
+        self.running_progress_buf += 1
 
         max_length = torch.clip(self.demo_data["seq_len"], 0, self.max_episode_length)
+        if self.rollout_len is not None:
+            max_length = torch.clamp(max_length, 0, self.rollout_len + self.rollout_begin + 3 + 1)
 
-        # Termination: task failed (large tracking error or physics error)
-        cur_idx = self.episode_length_buf
-        target_obj_transf = self.demo_data["obj_trajectory"][torch.arange(self.num_envs), cur_idx]
-        target_obj_pos = target_obj_transf[:, :3, 3]
-        diff_obj_pos_dist = torch.norm(target_obj_pos - self.object_pos, dim=-1)
+        # Compute curriculum scale factor
+        if self.training:
+            last_step = self.global_step_count
+            if self.tighten_method == "None":
+                scale_factor = 1.0
+            elif self.tighten_method == "const":
+                scale_factor = self.tighten_factor
+            elif self.tighten_method == "linear_decay":
+                scale_factor = 1 - (1 - self.tighten_factor) / self.tighten_steps * min(last_step, self.tighten_steps)
+            elif self.tighten_method == "exp_decay":
+                scale_factor = (np.e * 2) ** (-1 * last_step / self.tighten_steps) * (
+                    1 - self.tighten_factor
+                ) + self.tighten_factor
+            elif self.tighten_method == "cos":
+                scale_factor = self.tighten_factor + np.abs(
+                    -1 * (1 - self.tighten_factor) * np.cos(last_step / self.tighten_steps * np.pi)
+                ) * (2 ** (-1 * last_step / self.tighten_steps))
+            else:
+                scale_factor = 1.0
+        else:
+            scale_factor = 1.0
 
-        terminated = diff_obj_pos_dist > 0.1  # Large object tracking error
+        # Use cached values from _get_rewards (called before _get_dones in DirectRLEnv)
+        rc = self._reward_cache if hasattr(self, '_reward_cache') else {}
+        diff_obj_pos_dist = rc.get("diff_obj_pos_dist", torch.norm(
+            self.demo_data["obj_trajectory"][torch.arange(self.num_envs), self.episode_length_buf, :3, 3]
+            - self.object_pos, dim=-1
+        ))
+        diff_obj_rot_angle = rc.get("diff_obj_rot_angle", torch.zeros(self.num_envs, device=self.device))
+        diff_thumb_tip_pos_dist = rc.get("diff_thumb_tip_pos_dist", torch.zeros(self.num_envs, device=self.device))
+        diff_index_tip_pos_dist = rc.get("diff_index_tip_pos_dist", torch.zeros(self.num_envs, device=self.device))
+        diff_middle_tip_pos_dist = rc.get("diff_middle_tip_pos_dist", torch.zeros(self.num_envs, device=self.device))
+        diff_ring_tip_pos_dist = rc.get("diff_ring_tip_pos_dist", torch.zeros(self.num_envs, device=self.device))
+        diff_pinky_tip_pos_dist = rc.get("diff_pinky_tip_pos_dist", torch.zeros(self.num_envs, device=self.device))
+        diff_level_1_pos_dist = rc.get("diff_level_1_pos_dist", torch.zeros(self.num_envs, device=self.device))
+        diff_level_2_pos_dist = rc.get("diff_level_2_pos_dist", torch.zeros(self.num_envs, device=self.device))
+        finger_tip_distance = rc.get("finger_tip_distance", torch.ones(self.num_envs, 5, device=self.device))
+        current_eef_vel = rc.get("current_eef_vel", self.hand_root_state[:, 7:10])
+        current_eef_ang_vel = rc.get("current_eef_ang_vel", self.hand_root_state[:, 10:13])
+        joints_vel = rc.get("joints_vel", self.hand_body_vel)
+        current_obj_vel = rc.get("current_obj_vel", self.object_linvel)
+        current_obj_ang_vel = rc.get("current_obj_ang_vel", self.object_angvel)
 
-        # Timeout: reached max episode length or demo sequence end
-        time_out = self.episode_length_buf >= max_length - 1
+        # Sanity check: physics instability
+        current_dof_vel = self.hand.data.joint_vel
+        error_buf = (
+            (torch.norm(current_eef_vel, dim=-1) > 100)
+            | (torch.norm(current_eef_ang_vel, dim=-1) > 200)
+            | (torch.norm(joints_vel, dim=-1).mean(-1) > 100)
+            | (torch.abs(current_dof_vel).mean(-1) > 200)
+            | (torch.norm(current_obj_vel, dim=-1) > 100)
+            | (torch.norm(current_obj_ang_vel, dim=-1) > 200)
+        )
+        self.error_buf = error_buf
+
+        s = scale_factor
+        # Detailed failure conditions (matching original ManipTrans)
+        failed_execute = (
+            (
+                (diff_obj_pos_dist > 0.02 / 0.343 * s ** 3)
+                | (diff_thumb_tip_pos_dist > 0.04 / 0.7 * s)
+                | (diff_index_tip_pos_dist > 0.045 / 0.7 * s)
+                | (diff_middle_tip_pos_dist > 0.05 / 0.7 * s)
+                | (diff_pinky_tip_pos_dist > 0.06 / 0.7 * s)
+                | (diff_ring_tip_pos_dist > 0.06 / 0.7 * s)
+                | (diff_level_1_pos_dist > 0.07 / 0.7 * s)
+                | (diff_level_2_pos_dist > 0.08 / 0.7 * s)
+                | (diff_obj_rot_angle.abs() / np.pi * 180 > 30 / 0.343 * s ** 3)
+                | torch.any(
+                    (finger_tip_distance < 0.005) & ~self.tips_contact_history.any(1),
+                    dim=-1,
+                )
+            )
+            & (self.running_progress_buf >= 8)
+        ) | error_buf
+
+        # Success: reached end of trajectory
+        succeeded = (
+            self.episode_length_buf + 1 + 3 >= max_length
+        ) & ~failed_execute
+
+        terminated = failed_execute
+        time_out = succeeded
 
         # Update success/failure buffers
-        self.success_buf = time_out & ~terminated
-        self.failure_buf = terminated
+        self.success_buf = succeeded
+        self.failure_buf = failed_execute
 
         return terminated, time_out
 
