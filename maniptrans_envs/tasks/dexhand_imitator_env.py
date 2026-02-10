@@ -517,6 +517,8 @@ class DexHandImitatorEnv(DirectRLEnv):
                 collision_props=sim_utils.CollisionPropertiesCfg(
                     contact_offset=0.002,   # Reduced from 0.005 for tighter contact (original thickness=0.001)
                     rest_offset=0.0,
+                    torsional_patch_radius=0.01,      # Enable torsional friction (original: torsion_friction=0.01)
+                    min_torsional_patch_radius=0.005,  # Minimum torsional contact patch
                 ),
                 articulation_props=sim_utils.ArticulationRootPropertiesCfg(
                     enabled_self_collisions=self.dexhand.self_collision,
