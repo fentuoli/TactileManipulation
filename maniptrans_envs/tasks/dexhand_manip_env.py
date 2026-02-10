@@ -1154,6 +1154,9 @@ class DexHandManipEnv(DirectRLEnv):
             imit_obs = self._compute_imitator_obs()
             imit_obs = torch.nan_to_num(imit_obs, nan=0.0)
             self._base_action_buf = self.imitator_policy(imit_obs)
+            # Clip to [-1, 1] matching rl_games clipActions=1.0
+            # Without this, raw mu output (e.g. ±8.5) saturates DOFs at joint limits
+            self._base_action_buf = torch.clamp(self._base_action_buf, -1.0, 1.0)
             # Periodic diagnostic logging (every 500 steps)
             if self.global_step_count % 500 == 0 and self.global_step_count > 0:
                 a = self._base_action_buf
