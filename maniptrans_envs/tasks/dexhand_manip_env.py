@@ -825,7 +825,7 @@ class DexHandManipEnv(DirectRLEnv):
         # Get object mass from PhysX
         try:
             masses = self.object.root_physx_view.get_masses()  # (num_envs, 1)
-            self.manip_obj_mass = masses.squeeze(-1).clamp(max=0.5)  # cap at 500g like original
+            self.manip_obj_mass = masses.squeeze(-1).to(self.device).clamp(max=0.5)  # cap at 500g like original
             print(f"[INFO] Object mass: {self.manip_obj_mass[0].item():.4f} kg (capped at 0.5)")
         except Exception as e:
             print(f"[WARNING] Could not get object mass: {e}, using 0.1 kg")
