@@ -89,8 +89,13 @@ import math
 import os
 import random
 import time
+import torch
 import yaml
 from datetime import datetime
+
+# PyTorch 2.6+ defaults weights_only=True, but RL Games checkpoints contain numpy objects
+_original_torch_load = torch.load
+torch.load = lambda *args, **kwargs: _original_torch_load(*args, **{**kwargs, 'weights_only': kwargs.get('weights_only', False)})
 
 from rl_games.common import env_configurations, vecenv
 from rl_games.common.algo_observer import IsaacAlgoObserver
