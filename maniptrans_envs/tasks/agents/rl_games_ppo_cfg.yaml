@@ -1,5 +1,7 @@
-# RL Games PPO Configuration for DexHand Manipulation
-# Based on IsaacLab's allegro_hand config adapted for ManipTrans
+# RL Games PPO Configuration for DexHand Residual Manipulation
+# Matched to original ManipTrans ResDexHandPPO.yaml
+# Uses custom dict_obs_actor_critic network + my_continuous_a2c_logstd model
+# for per-key observation normalization and SimpleFeatureFusion.
 
 params:
   seed: 42
@@ -13,23 +15,45 @@ params:
     name: a2c_continuous
 
   model:
-    name: continuous_a2c_logstd
+    name: my_continuous_a2c_logstd
 
   network:
-    name: actor_critic
+    name: dict_obs_actor_critic
     separate: False
     space:
       continuous:
         mu_activation: None
         sigma_activation: None
         mu_init:
-          name: default
+          name: glorot_normal_initializer
+          gain: 0.01
         sigma_init:
           name: const_initializer
-          val: 0
+          val: -1
         fixed_sigma: True
+
+    # Dict feature encoder: processes dict obs through per-key extractors
+    # then fuses via head MLP. Extractor input_dims are set at runtime
+    # from the environment's actual observation dimensions.
+    dict_feature_encoder:
+      extractors:
+        proprioception:
+          input_dim: -1  # set at runtime: 3*n_dofs + 13
+        privileged:
+          input_dim: -1  # set at runtime: n_dofs + 37
+        target:
+          input_dim: -1  # set at runtime: complex, depends on hand type
+        base_action:
+          input_dim: -1  # set at runtime: 6 + n_dofs
+      hidden_depth: 3
+      hidden_dim: 512
+      output_dim: 256
+      activation: "swish"
+      add_input_activation: false
+      add_output_activation: false
+
     mlp:
-      units: [512, 256, 128]
+      units: [256, 512, 128, 64]
       activation: elu
       d2rl: False
       initializer:
@@ -49,29 +73,30 @@ params:
     ppo: True
     mixed_precision: False
     normalize_input: True
+    normalize_input_excluded_keys: []
     normalize_value: True
     value_bootstrap: True
     num_actors: -1  # configured from the script
     reward_shaper:
-      scale_value: 0.01
+      scale_value: 1.0
     normalize_advantage: True
     gamma: 0.99
     tau: 0.95
     learning_rate: 5e-4
     lr_schedule: adaptive
     schedule_type: standard
-    kl_threshold: 0.016
+    kl_threshold: 0.008
     score_to_win: 100000
     max_epochs: 5000
-    save_best_after: 100
-    save_frequency: 200
+    save_best_after: 2
+    save_frequency: 100
     print_stats: True
     grad_norm: 1.0
     entropy_coef: 0.0
     truncate_grads: True
     e_clip: 0.2
-    horizon_length: 16
-    minibatch_size: 64  # Adjusted for small num_envs; increase with more envs
+    horizon_length: 32
+    minibatch_size: 1024
     mini_epochs: 5
     critic_coef: 4
     clip_value: True

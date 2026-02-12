@@ -99,6 +99,7 @@ torch.load = lambda *args, **kwargs: _original_torch_load(*args, **{**kwargs, 'w
 
 from rl_games.common import env_configurations, vecenv
 from rl_games.common.algo_observer import IsaacAlgoObserver
+from rl_games.algos_torch.model_builder import register_network, register_model
 from rl_games.torch_runner import Runner
 
 from isaaclab.envs import DirectRLEnvCfg
@@ -106,6 +107,16 @@ from isaaclab.utils.dict import print_dict
 from isaaclab.utils.io import dump_yaml
 
 from isaaclab_rl.rl_games import RlGamesGpuEnv, RlGamesVecEnvWrapper
+
+# Import custom RL-Games components (dict obs network + per-key normalization model)
+from maniptrans_envs.lib.rl import DictObsBuilder, ModelA2CContinuousLogStd
+
+# Register custom network and model with RL-Games factory
+# These match the original ManipTrans architecture:
+# - dict_obs_actor_critic: SimpleFeatureFusion + actor_mlp (processes dict obs)
+# - my_continuous_a2c_logstd: RunningMeanStdObs for per-key observation normalization
+register_network("dict_obs_actor_critic", DictObsBuilder)
+register_model("my_continuous_a2c_logstd", ModelA2CContinuousLogStd)
 
 # Register ManipTrans environments
 from maniptrans_envs.tasks import register_maniptrans_envs
@@ -284,7 +295,18 @@ def main():
     start_time = time.time()
 
     # Wrap around environment for rl-games
-    env = RlGamesVecEnvWrapper(env, rl_device, clip_obs, clip_actions)
+    # Residual env returns Dict obs (proprioception, privileged, target, base_action)
+    # Imitator env returns flat obs ({"policy": tensor})
+    obs_group_keys = list(env.unwrapped.single_observation_space.keys())
+    use_dict_obs = "policy" not in obs_group_keys  # Dict obs if env doesn't use "policy" key
+    if use_dict_obs:
+        env = RlGamesVecEnvWrapper(
+            env, rl_device, clip_obs, clip_actions,
+            obs_groups={"obs": obs_group_keys, "states": []},
+            concate_obs_group=False,
+        )
+    else:
+        env = RlGamesVecEnvWrapper(env, rl_device, clip_obs, clip_actions)
 
     # Register the environment to rl-games registry
     vecenv.register(
@@ -294,6 +316,16 @@ def main():
 
     # Set number of actors into agent config
     agent_cfg["params"]["config"]["num_actors"] = env.unwrapped.num_envs
+
+    # Set dict_feature_encoder extractor dims from actual env observation dims
+    # These are computed dynamically based on hand type (n_dofs, n_bodies, etc.)
+    if "dict_feature_encoder" in agent_cfg["params"]["network"]:
+        dfe = agent_cfg["params"]["network"]["dict_feature_encoder"]
+        unwrapped = env.unwrapped
+        for key in dfe["extractors"]:
+            space = unwrapped.single_observation_space[key]
+            dfe["extractors"][key]["input_dim"] = space.shape[0]
+            print(f"[INFO] dict_feature_encoder.{key}.input_dim = {space.shape[0]}")
 
     # Create runner from rl-games
     runner = Runner(IsaacAlgoObserver())

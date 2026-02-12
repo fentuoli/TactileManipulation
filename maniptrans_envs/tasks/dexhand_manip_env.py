@@ -408,11 +408,18 @@ class DexHandManipEnv(DirectRLEnv):
         # + manip_obj_ang_vel(3) + tip_force_with_mag(n_contact*4) + manip_obj_com_rel(3) + manip_obj_weight(1)
         priv_obs_dim = n_dofs + 3 + 4 + 3 + 3 + n_contact_bodies * 4 + 3 + 1
 
-        cfg.num_observations = prop_obs_dim + priv_obs_dim + target_obs_dim
-        cfg.observation_space = cfg.num_observations  # Sync with num_observations for RL framework
+        # Add base_action (imitator output) to observations so residual PPO can see it
+        # Original ManipTrans feeds base_action directly to residual MLP as input
+        base_action_obs_dim = 6 + n_dofs  # force(3) + torque(3) + dof(n_dofs)
+        cfg.num_observations = prop_obs_dim + priv_obs_dim + target_obs_dim + base_action_obs_dim
+        cfg.observation_space = cfg.num_observations  # Needed by DirectRLEnv init
         cfg.num_states = 0  # No asymmetric states for now
 
+        # Store individual obs dims for Dict observation space setup (after super init)
+        self._prop_obs_dim = prop_obs_dim
         self._priv_obs_dim = priv_obs_dim
+        self._target_obs_dim = target_obs_dim
+        self._base_action_obs_dim = base_action_obs_dim
 
         # Compute imitator observation dimension (for loading frozen imitator)
         n_joint_bodies_imit = self.dexhand.n_bodies - 1
@@ -430,8 +437,8 @@ class DexHandManipEnv(DirectRLEnv):
         self._imitator_action_dim = 6 + n_dofs  # imitator always uses force control: 6 wrist + n_dofs
 
         print(f"[INFO] Manip obs dims: prop={prop_obs_dim}, priv={priv_obs_dim}, "
-              f"target={target_obs_dim} (bps=128, obj2joints={n_all_bodies}, "
-              f"per_frame*{cfg.obs_future_length}), total={cfg.num_observations}")
+              f"target={target_obs_dim}, base_action={base_action_obs_dim}, "
+              f"total={cfg.num_observations}")
         print(f"[INFO] Manip action dim: {cfg.num_actions} (residual only, "
               f"root({residual_root_dims})+{n_dofs}dofs)")
         ckpt_side = cfg.rh_base_checkpoint if cfg.side == "right" else cfg.lh_base_checkpoint
@@ -439,6 +446,22 @@ class DexHandManipEnv(DirectRLEnv):
         print(f"[INFO] Imitator obs_dim={self._imitator_obs_dim}, action_dim={self._imitator_action_dim}")
 
         super().__init__(cfg, render_mode, **kwargs)
+
+        # Override single_observation_space with Dict space for per-key normalization
+        # This matches the original ManipTrans Dict obs structure used by
+        # RunningMeanStdObs and SimpleFeatureFusion (sorted key order:
+        # base_action, privileged, proprioception, target)
+        import gymnasium as gym_
+        self.single_observation_space = gym_.spaces.Dict({
+            "proprioception": gym_.spaces.Box(
+                low=-np.inf, high=np.inf, shape=(self._prop_obs_dim,)),
+            "privileged": gym_.spaces.Box(
+                low=-np.inf, high=np.inf, shape=(self._priv_obs_dim,)),
+            "target": gym_.spaces.Box(
+                low=-np.inf, high=np.inf, shape=(self._target_obs_dim,)),
+            "base_action": gym_.spaces.Box(
+                low=-np.inf, high=np.inf, shape=(self._base_action_obs_dim,)),
+        })
 
         # Store configuration
         self.use_quat_rot = cfg.use_quat_rot
@@ -1197,7 +1220,9 @@ class DexHandManipEnv(DirectRLEnv):
             1.0 * base_action[:, 6:6 + self.dexhand.n_dofs]
             + residual_action[:, res_root:res_root + self.dexhand.n_dofs]
         )
-        dof_pos_demo_order = torch.clamp(dof_pos_demo_order, -1, 1)
+        # No clamp here: original ManipTrans allows base+residual to exceed [-1,1]
+        # base is in [-1,1], residual is in [-2,2], so sum can be [-3,3]
+        # The subsequent scale() will map to joint limits, then saturate() clamps to physical limits
 
         # Reorder from demo order to IsaacLab order using scatter
         indices = self.demo_to_isaaclab_dof_mapping.unsqueeze(0).expand(dof_pos_demo_order.shape[0], -1)
@@ -1477,17 +1502,25 @@ class DexHandManipEnv(DirectRLEnv):
         # Target observations (from demo data)
         target_obs = self._compute_target_observations()
 
-        # Combine observations: prop + priv + target (matching original Dict obs layout)
-        obs = torch.cat([prop_obs, priv_obs, target_obs], dim=-1)
+        # Return Dict observations for per-key normalization (RunningMeanStdObs)
+        # and feature fusion (SimpleFeatureFusion).
+        # Keys are sorted alphabetically by the fusion module:
+        # base_action, privileged, proprioception, target
+        obs_dict = {
+            "proprioception": prop_obs,
+            "privileged": priv_obs,
+            "target": target_obs,
+            "base_action": self._base_action_buf,
+        }
 
         # Check for NaN values
-        if torch.isnan(obs).any():
-            nan_count = torch.isnan(obs).sum().item()
-            print(f"[WARNING] NaN detected in observations! Count: {nan_count}")
-            # Replace NaN with zeros to prevent crash
-            obs = torch.nan_to_num(obs, nan=0.0)
+        for key, val in obs_dict.items():
+            if torch.isnan(val).any():
+                nan_count = torch.isnan(val).sum().item()
+                print(f"[WARNING] NaN detected in observations[{key}]! Count: {nan_count}")
+                obs_dict[key] = torch.nan_to_num(val, nan=0.0)
 
-        return {"policy": obs}
+        return obs_dict
 
     def _compute_intermediate_values(self):
         """Compute intermediate state values."""
